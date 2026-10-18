@@ -65,3 +65,13 @@ VALUES (
   'https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt',
   'community', 1, 60, 0, datetime('now'), datetime('now')
 );
+
+-- filembad Telegram config subscription (hidden from user)
+-- Latest 5 configs are fetched and shown in the Connect tab
+INSERT INTO Subscription (id, label, url, kind, enabled, intervalMin, lastCount, createdAt, updatedAt)
+VALUES (
+  lower(hex(randomblob(12))),
+  'filembad',
+  'https://t.me/filembad',
+  'community', 1, 30, 0, datetime('now'), datetime('now')
+);

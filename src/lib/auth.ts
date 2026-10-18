@@ -35,12 +35,10 @@ export function checkAuth(req: NextRequest): NextResponse | null {
   // DESKTOP MODE: if the request comes from localhost (the bundled desktop
   // app's Next.js server), bypass auth entirely. The desktop app runs on
   // the user's machine and there's no remote attacker to protect against.
-  // This fixes the bug where subscriptions POST / imported-configs DELETE
-  // returned 503 in the desktop app because DISTORT_API_KEY wasn't set.
   const host = req.headers.get("host") || "";
   const isLocalhost = host.startsWith("127.0.0.1") || host.startsWith("localhost") || host.startsWith("::1");
-  if (isLocalhost && !isAuthConfigured()) {
-    // Localhost + no API key configured = desktop app mode — allow all
+  if (isLocalhost) {
+    // Localhost = desktop app — allow all requests regardless of API key
     return null;
   }
 
@@ -56,12 +54,9 @@ export function checkAuth(req: NextRequest): NextResponse | null {
   }
 
   // If no key configured (dev mode), endpoints are open — but we add a WARNING header.
-  // This makes it obvious to anyone hitting the API that the server is NOT secured.
   if (!isAuthConfigured()) {
     const response = NextResponse.next();
     response.headers.set("X-Distort-Warning", "DEV MODE: API authentication not configured. Do NOT expose to the internet.");
-    // We can't easily add headers to the actual response here since we return null,
-    // but the warning is logged at startup. For production, the 503 above fires.
     console.warn("[auth] DEV MODE: DISTORT_API_KEY not set. Protected endpoints are OPEN. Do NOT expose to internet.");
     return null;
   }
