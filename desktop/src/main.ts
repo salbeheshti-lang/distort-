@@ -29,7 +29,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.9 (auto-update test)`);
+log.info(`App version: 1.0.10`);
 log.info("============================================================");
 
 // ---------------------------------------------------------------------------

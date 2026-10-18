@@ -12,11 +12,15 @@ INSERT INTO UserSetting (
   '1.1.1.1,9.9.9.9', datetime('now')
 );
 
--- Founder admin user (no password — user can set it via /admin login)
-INSERT INTO User (id, email, name, tier, isAdmin, createdAt, updatedAt)
+-- Founder admin user (with default password — user can change it later via /admin)
+-- Default password: distort2026
+-- Hash = SHA256(password + SESSION_SECRET)
+-- SESSION_SECRET = "distort-desktop-session-secret-local" (set in desktop/src/main.ts)
+INSERT INTO User (id, email, name, tier, isAdmin, passwordHash, createdAt, updatedAt)
 VALUES (
   lower(hex(randomblob(12))),
   'founder@distort.app', 'Distort Founder', 'vip', 1,
+  'ec1c1b63a7b395d36de9231364cb8b8e9b3b2c6825b2f0d5d1f29e9f4436c822',
   datetime('now'), datetime('now')
 );
 
