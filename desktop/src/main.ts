@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.21`);
+log.info(`App version: 1.0.22`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -361,7 +361,7 @@ function buildXrayConfigFromUri(configUri: string): object {
   }
   const settings = store.get("settings");
   return buildRealXrayConfig(realCfg, {
-    tun: true, // system-wide tunnel via wintun.dll
+    tun: false, // SOCKS5 + HTTP proxy mode — no admin required
     socksPort: 10808,
     httpPort: 10809,
     dnsLeakProtection: settings.dnsLeakProtection !== false,
@@ -702,13 +702,24 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
 async function stopVpnEngine(): Promise<void> {
   // Stop health monitoring when tunnel goes down
   stopHealthMonitoring();
-  // NOTE: Do NOT reset reconnectAttempts here — that's done by smartReconnect
-  // only after SUCCESSFUL reconnection. Resetting here would allow infinite retries.
   log.info("Stopping xray-core…");
+
+  // Clear the browser proxy — stop routing through VPN
+  try {
+    await session.defaultSession.setProxy({ proxyRules: "" });
+    log.info("[vpn] Browser proxy cleared");
+  } catch (e: any) {
+    log.warn(`[vpn] Failed to clear browser proxy: ${e?.message}`);
+  }
+
+  // Clear env proxy vars
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
+  delete process.env.ALL_PROXY;
+
   if (vpnProcess) {
     try {
       vpnProcess.kill("SIGTERM");
-      // Give it 500ms to exit gracefully
       await new Promise((r) => setTimeout(r, 500));
       if (!vpnProcess.killed) {
         vpnProcess.kill("SIGKILL");
@@ -719,16 +730,15 @@ async function stopVpnEngine(): Promise<void> {
     vpnProcess = null;
   }
 
-  // If kill switch is enabled, block all non-tunnel traffic until user reconnects.
-  // On Windows: use netsh advfirewall to add a block rule (requires admin).
-  // On macOS/Linux: we can't easily block without root, so we just warn the user.
-  const settings = store.get("settings");
-  if (settings.killSwitch && process.platform === "win32") {
-    await enableKillSwitch();
-  } else if (settings.killSwitch) {
-    log.warn("Kill switch: not implemented on this platform — traffic may leak");
-    mainWindow?.webContents.send("vpn:warning", "Kill switch is enabled but not implemented on this platform. Your real IP may be exposed.");
-  }
+  // NOTE: Kill switch is disabled in proxy mode (no TUN).
+  // In proxy mode, traffic outside the browser is not routed through xray,
+  // so a kill switch would block ALL traffic (including the browser's
+  // connection to the proxy itself). This would break the VPN entirely.
+  // Kill switch only makes sense with TUN mode (system-wide VPN).
+  // const settings = store.get("settings");
+  // if (settings.killSwitch && process.platform === "win32") {
+  //   await enableKillSwitch();
+  // }
 
   store.set("vpn", {
     connected: false,
@@ -1564,6 +1574,27 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
 
     log.info("[companion-api] xray spawned successfully (configUri REDACTED)");
+
+    // CRITICAL: Set Electron's browser proxy to route through xray's SOCKS5.
+    // This makes ALL browser traffic (the dashboard + any web requests) go
+    // through the VPN tunnel — no TUN device needed, no admin required.
+    try {
+      await session.defaultSession.setProxy({
+        proxyRules: "socks5://127.0.0.1:10808",
+      });
+      log.info("[companion-api] Browser proxy set to socks5://127.0.0.1:10808");
+    } catch (e: any) {
+      log.warn(`[companion-api] Failed to set browser proxy: ${e?.message}`);
+    }
+
+    // Also set the proxy for the Next.js server's outbound requests
+    // (so /api/ip-info goes through the VPN)
+    try {
+      process.env.HTTP_PROXY = "http://127.0.0.1:10809";
+      process.env.HTTPS_PROXY = "http://127.0.0.1:10809";
+      process.env.ALL_PROXY = "socks5://127.0.0.1:10808";
+    } catch {}
+
     return { ok: true };
   } catch (e: any) {
     log.error(`[companion-api] Failed to spawn xray: ${e?.message}`);
