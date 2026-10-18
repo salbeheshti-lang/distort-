@@ -14,11 +14,33 @@ import { initDatabase } from "./db-init";
 
 // ---------------------------------------------------------------------------
 // Logging — configure early so we capture errors during startup.
-// electron-log writes to:
-//   - Windows: %APPDATA%/DISTORT/logs/main.log
-//   - macOS:   ~/Library/Logs/DISTORT/main.log
-//   - Linux:   ~/.config/DISTORT/logs/main.log
+// We set a FIXED log file path so the user can always find it at:
+//   %APPDATA%\DISTORT\logs\main.log
 // ---------------------------------------------------------------------------
+import { mkdirSync, existsSync } from "fs";
+
+// Determine the DISTORT data directory.
+// On Windows: %APPDATA%\DISTORT
+// On macOS:   ~/Library/Application Support/DISTORT
+// On Linux:   ~/.config/DISTORT
+// We use "DISTORT" (uppercase) regardless of what app.getName() returns.
+const DISTORT_DATA_DIR = process.platform === "win32"
+  ? path.join(process.env.APPDATA || path.join(process.env.HOME || "", "AppData", "Roaming"), "DISTORT")
+  : process.platform === "darwin"
+  ? path.join(process.env.HOME || "", "Library", "Application Support", "DISTORT")
+  : path.join(process.env.HOME || "", ".config", "DISTORT");
+
+// Create the logs directory if it doesn't exist
+const LOG_DIR = path.join(DISTORT_DATA_DIR, "logs");
+try {
+  mkdirSync(LOG_DIR, { recursive: true });
+} catch (e: any) {
+  // Directory might already exist or we lack permissions — log error to console
+  console.error(`Failed to create log directory ${LOG_DIR}: ${e?.message}`);
+}
+
+// Force electron-log to write to our fixed path
+log.transports.file.resolvePathFn = () => path.join(LOG_DIR, "main.log");
 log.transports.file.level = "info";
 log.transports.console.level = "info";
 
@@ -29,7 +51,9 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.10`);
+log.info(`App version: 1.0.11`);
+log.info(`Data dir: ${DISTORT_DATA_DIR}`);
+log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
 
 // ---------------------------------------------------------------------------
@@ -2234,7 +2258,7 @@ function startNextServer(): Promise<void> {
     // DATABASE_URL: the Next.js server needs a SQLite database. We put it
     // in the user's userData directory so it persists across app updates.
     // The path must use file: prefix for Prisma to recognize it as SQLite.
-    const dbPath = path.join(app.getPath("userData"), "distort.db");
+    const dbPath = path.join(DISTORT_DATA_DIR, "distort.db");
     const dbDir = path.dirname(dbPath);
     if (!fs.existsSync(dbDir)) {
       try { fs.mkdirSync(dbDir, { recursive: true }); } catch {}
