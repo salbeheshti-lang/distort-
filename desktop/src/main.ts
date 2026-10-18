@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.17`);
+log.info(`App version: 1.0.18`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -1798,6 +1798,8 @@ async function handleCompanionApiRequest(
 const COMPANION_ALLOWED_ORIGINS = new Set<string>([
   "http://localhost:3000",
   "http://127.0.0.1:3000",
+  "http://localhost:38571",
+  "http://127.0.0.1:38571",
   "https://distort.app",
   "https://www.distort.app",
   "app://",
@@ -2042,8 +2044,8 @@ function setupAutoUpdater(): void {
   const isDev = !!process.env.DISTORT_DEV || !app.isPackaged;
 
   // Configuration
-  updater.autoDownload = true;             // download in background as soon as available
-  updater.autoInstallOnAppQuit = true;    // install silently on next quit
+  updater.autoDownload = false;            // DON'T auto-download — ask user first
+  updater.autoInstallOnAppQuit = false;   // DON'T auto-install — user must confirm
   // We explicitly do NOT disable code-signature verification in production
   // (win.verifyUpdateCodeSignature in package.json is already false because
   // we have no cert — that only disables electron-builder's BUILDER-time
@@ -2067,6 +2069,26 @@ function setupAutoUpdater(): void {
       version: info?.version ?? null,
       releaseDate: info?.releaseDate ?? null,
       releaseNotes: info?.releaseNotes ?? null,
+    });
+
+    // Show a dialog asking if user wants to download
+    dialog.showMessageBox({
+      type: "info",
+      title: "DISTORT Update Available",
+      message: `Version ${info?.version || "new"} is available.`,
+      detail: `You are currently running v${app.getVersion()}.\n\nWould you like to download the update now? You can install it later.`,
+      buttons: ["Download now", "Later"],
+      defaultId: 0,
+      cancelId: 1,
+    }).then((choice) => {
+      if (choice.response === 0) {
+        log.info("[auto-updater] User chose to download — starting download…");
+        updater.downloadUpdate().catch((err: Error) => {
+          log.error(`[auto-updater] Download failed: ${err?.message}`);
+        });
+      } else {
+        log.info("[auto-updater] User chose to skip this update");
+      }
     });
   });
 

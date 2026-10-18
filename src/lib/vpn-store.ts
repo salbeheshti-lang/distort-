@@ -165,10 +165,42 @@ export const useVpnStore = create<VpnStore>()(
             live: { ...initialLive, connectedSince: now, ping: server.ping || rand(18, 70) },
           });
 
-          // Start a live ticker simulating traffic (DEMO ONLY)
-          const ticker = window.setInterval(() => {
+          // Start a live ticker that reads REAL speed from companion API.
+          // Falls back to demo simulation if companion is not available.
+          const ticker = window.setInterval(async () => {
             const s = get();
             if (s.state !== "connected") return;
+
+            // Try to read real speed from companion API
+            try {
+              const resp = await fetch("http://127.0.0.1:10810/api/tunnel/status");
+              if (resp.ok) {
+                const data = await resp.json();
+                if (data.running && data.downBps !== undefined) {
+                  // REAL speeds from xray-core
+                  const downBps = data.downBps || 0;
+                  const upBps = data.upBps || 0;
+                  const jitter = rand(-2, 3);
+                  set({
+                    live: {
+                      downBps,
+                      upBps,
+                      totalDown: s.live.totalDown + downBps,
+                      totalUp: s.live.totalUp + upBps,
+                      ping: Math.max(8, s.live.ping + jitter),
+                      connectedSince: s.live.connectedSince,
+                      exitIp: data.exitIp || s.live.exitIp,
+                      exitCountry: data.exitCountry || s.live.exitCountry,
+                    },
+                  });
+                  return;
+                }
+              }
+            } catch {
+              // Companion API not available — fall through to demo mode
+            }
+
+            // DEMO FALLBACK — simulated speeds (when companion API is not running)
             const burst = Math.random() > 0.8;
             const downBps = burst ? rand(4, 14) * 1_000_000 : rand(200_000, 2_500_000);
             const upBps = burst ? rand(1, 4) * 1_000_000 : rand(60_000, 700_000);
