@@ -22,7 +22,7 @@ export function DistortLogo({ size = 64, className, glow = true, animate = false
       <svg
         viewBox="0 0 100 100"
         fill="none"
-        xmlns="http://www.w3.org/2000/svg"
+        xmlns="http://www.w3.org/2000/svg" shapeRendering="geometricPrecision"
         className={glow ? "logo-glow" : ""}
         style={{ width: "100%", height: "100%" }}
       >

@@ -38,7 +38,7 @@ export function Dashboard({ onClose }: { onClose: () => void }) {
       {/* Sidebar (desktop) */}
       <aside className="hidden md:flex w-60 shrink-0 flex-col border-r border-white/5 bg-[#070b16]/80 backdrop-blur-xl sticky top-14 self-start h-[calc(100vh-3.5rem)]">
         <div className="p-4 border-b border-white/5">
-          <DistortWordmark size={28} showTagline />
+          <DistortWordmark size={32} showTagline />
         </div>
         <nav className="flex-1 p-3 space-y-1">
           {NAV.map((n) => (
@@ -173,7 +173,7 @@ function HelpView() {
           <div>
             <h3 className="text-xl font-bold text-white">DISTORT</h3>
             <p className="text-sm text-muted-foreground">Freedom Beyond Borders</p>
-            <p className="text-xs text-[#5cf2ff] font-tech mt-1">v1.0.20 · 100% Free · MIT</p>
+            <p className="text-xs text-[#5cf2ff] font-tech mt-1">v1.0.23 · 100% Free · MIT</p>
           </div>
         </div>
       </div>
@@ -256,12 +256,20 @@ function SystemStatusButton() {
 
   const handleCheck = async () => {
     setLoading(true);
+    setStatus(null);
     try {
-      const resp = await fetch("/api/diagnostic");
+      // Try the full diagnostic first
+      const resp = await fetch("/api/tunnel/diagnostic");
       if (resp.ok) {
         setStatus(await resp.json());
       } else {
-        setStatus({ error: `HTTP ${resp.status}` });
+        // Fallback to basic diagnostic
+        const resp2 = await fetch("/api/diagnostic");
+        if (resp2.ok) {
+          setStatus(await resp2.json());
+        } else {
+          setStatus({ error: `HTTP ${resp.status} / ${resp2.status}` });
+        }
       }
     } catch (e) {
       setStatus({ error: (e as Error).message });
@@ -276,9 +284,31 @@ function SystemStatusButton() {
         {loading ? "Checking…" : "Run Diagnostic"}
       </Button>
       {status && (
-        <pre className="mt-2 text-[10px] text-muted-foreground bg-black/30 rounded p-2 overflow-auto max-h-40">
-          {JSON.stringify(status, null, 2)}
-        </pre>
+        <div className="mt-3 space-y-2">
+          {status.overall && (
+            <div className={`text-xs font-tech uppercase tracking-wider ${status.overall === "ALL_OK" ? "text-[#10d9a0]" : "text-[#ff4d6d]"}`}>
+              {status.overall === "ALL_OK" ? "✓ All systems OK" : "✗ Issues detected"}
+            </div>
+          )}
+          {status.checks && Object.entries(status.checks as Record<string, any>).map(([key, val]) => (
+            <div key={key} className="text-[10px] flex items-start gap-2">
+              <span className={val?.ok ? "text-[#10d9a0]" : "text-[#ff4d6d]"}>
+                {val?.ok ? "✓" : "✗"}
+              </span>
+              <div>
+                <span className="text-muted-foreground uppercase">{key}: </span>
+                <span className={val?.ok ? "text-white" : "text-[#ff4d6d]"}>
+                  {val?.ok ? "OK" : val?.error || "Failed"}
+                </span>
+                {val?.ip && <span className="text-muted-foreground"> ({val.ip})</span>}
+                {val?.servers !== undefined && <span className="text-muted-foreground"> ({val.servers} servers, {val.configs} configs)</span>}
+              </div>
+            </div>
+          ))}
+          <pre className="text-[9px] text-muted-foreground/60 bg-black/30 rounded p-2 overflow-auto max-h-32 mt-2">
+            {JSON.stringify(status, null, 2)}
+          </pre>
+        </div>
       )}
     </div>
   );
