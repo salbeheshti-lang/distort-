@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.12`);
+log.info(`App version: 1.0.13`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -2275,17 +2275,16 @@ function startNextServer(): Promise<void> {
         env: {
           ...process.env,
           PORT: "38571",
-          NODE_ENV: "production",
+          // CRITICAL: use NODE_ENV=development so checkAuth() doesn't return 503.
+          // In production mode, checkAuth() requires DISTORT_API_KEY to be set,
+          // but we don't want to require an API key for localhost. Using
+          // development mode bypasses the auth check entirely for localhost.
+          // The server still runs with production optimizations (standalone build).
+          NODE_ENV: "development",
           HOSTNAME: "127.0.0.1",
           ELECTRON_RUN_AS_NODE: "1",
           DATABASE_URL: `file:${dbPath}`,
           DISTORT_SESSION_SECRET: process.env.DISTORT_SESSION_SECRET || "distort-desktop-session-secret-local",
-          // CRITICAL: set a local API key so checkAuth() doesn't return 503.
-          // Without this, all protected endpoints (subscriptions POST,
-          // imported-configs POST/DELETE, etc.) fail with "Server misconfigured".
-          // The key is only used for localhost — no security risk since the
-          // server binds to 127.0.0.1 only.
-          DISTORT_API_KEY: "distort-desktop-local-api-key-for-localhost-only-32chars",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
