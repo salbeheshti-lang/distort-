@@ -2280,6 +2280,12 @@ function startNextServer(): Promise<void> {
           ELECTRON_RUN_AS_NODE: "1",
           DATABASE_URL: `file:${dbPath}`,
           DISTORT_SESSION_SECRET: process.env.DISTORT_SESSION_SECRET || "distort-desktop-session-secret-local",
+          // CRITICAL: set a local API key so checkAuth() doesn't return 503.
+          // Without this, all protected endpoints (subscriptions POST,
+          // imported-configs POST/DELETE, etc.) fail with "Server misconfigured".
+          // The key is only used for localhost — no security risk since the
+          // server binds to 127.0.0.1 only.
+          DISTORT_API_KEY: "distort-desktop-local-api-key-for-localhost-only-32chars",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
