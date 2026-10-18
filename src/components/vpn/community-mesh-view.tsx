@@ -297,7 +297,7 @@ export function CommunityMeshView() {
         <CardHeader className="pb-2">
           <div className="flex items-center justify-between">
             <CardTitle className="font-display tracking-wider text-sm flex items-center gap-2">
-              <ServerIcon className="w-4 h-4 text-[#8b5cf6]" /> Community Mesh
+              <ServerIcon className="w-4 h-4 text-[#8b5cf6]" /> Distort Config
               <span className="text-xs text-muted-foreground font-tech">· {configs.length} configs</span>
             </CardTitle>
             <span className="text-[10px] text-muted-foreground font-tech uppercase tracking-wider">
@@ -434,7 +434,7 @@ function ImportDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenCha
             <Plus className="w-4 h-4 text-[#00f0ff]" /> Import Personal Configs
           </DialogTitle>
           <DialogDescription className="text-muted-foreground">
-            Paste one or more <code className="text-[#5cf2ff]">vmess://</code>, <code className="text-[#5cf2ff]">vless://</code>, <code className="text-[#5cf2ff]">trojan://</code> or <code className="text-[#5cf2ff]">ss://</code> URIs (one per line). They will be parsed, scored, and added to your Community Mesh.
+            Paste one or more <code className="text-[#5cf2ff]">vmess://</code>, <code className="text-[#5cf2ff]">vless://</code>, <code className="text-[#5cf2ff]">trojan://</code> or <code className="text-[#5cf2ff]">ss://</code> URIs (one per line). They will be parsed, scored, and added to your Distort Config.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">

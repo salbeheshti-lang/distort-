@@ -83,7 +83,7 @@ export function AccountView() {
   const requestProvisionedConfig = () => {
     toast.error("Provisioning is not yet available", {
       description:
-        "Use the Community Mesh tab to import real configs from the Iran subscription, or paste your own config URI.",
+        "Use the Distort Config tab to import real configs from the Iran subscription, or paste your own config URI.",
     });
   };
 
@@ -211,7 +211,7 @@ export function AccountView() {
               <span className="font-tech uppercase tracking-wider">Template / preview only —</span>{" "}
               configs generated here use <span className="font-semibold">sample credentials</span> and
               <span className="font-semibold"> cannot connect</span>. For a real connection, use the
-              Community Mesh tab or your own server.
+              Distort Config tab or your own server.
             </p>
           </div>
 
@@ -247,7 +247,7 @@ export function AccountView() {
 
           {/* Provisioned-config CTA — separate path from the template
               generator above. Clicking it surfaces the (stub) provisioning
-              unavailability so the user is redirected to Community Mesh. */}
+              unavailability so the user is redirected to Distort Config. */}
           <Button
             variant="outline"
             onClick={requestProvisionedConfig}
