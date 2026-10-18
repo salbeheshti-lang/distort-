@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.18`);
+log.info(`App version: 1.0.19`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -227,6 +227,10 @@ function createTray(): void {
     const vpn = store.get("vpn");
     const menu = Menu.buildFromTemplate([
       {
+        label: `DISTORT v${app.getVersion()}`,
+        enabled: false,
+      },
+      {
         label: vpn.connected ? "● Connected" : "○ Disconnected",
         enabled: false,
       },
@@ -238,6 +242,25 @@ function createTray(): void {
             disconnectVpn();
           } else {
             quickConnect();
+          }
+        },
+      },
+      {
+        label: "Check for Updates",
+        click: () => {
+          mainWindow?.webContents.send("update:check-now-trigger");
+          if (autoUpdaterModule) {
+            autoUpdaterModule.checkForUpdates().catch((err: Error) => {
+              dialog.showErrorBox("Update Check Failed", err?.message || "Unknown error");
+            });
+          } else {
+            dialog.showMessageBox({
+              type: "info",
+              title: "DISTORT Updates",
+              message: `You are running v${app.getVersion()}.`,
+              detail: "Auto-update is not available in this build.\n\nCheck https://github.com/di6tort-bit/distort/releases for the latest version.",
+              buttons: ["OK"],
+            });
           }
         },
       },

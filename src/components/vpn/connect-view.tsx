@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
+import { IpLocationWidget } from "./ip-location-widget";
 
 type IranConfig = {
   id: string;
@@ -405,6 +406,9 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           <Badge variant="outline" className="border-[#10d9a0]/30 text-[#10d9a0] text-xs">No Trackers</Badge>
         )}
       </div>
+
+      {/* --- IP location widget (real IP vs VPN IP) --- */}
+      <IpLocationWidget isConnected={isConnected} />
 
       {/* --- Desktop companion status --- */}
       {!isDesktop && (
