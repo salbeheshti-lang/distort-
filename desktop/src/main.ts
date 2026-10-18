@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.19`);
+log.info(`App version: 1.0.20`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -116,10 +116,10 @@ function createWindow(): void {
   const preloadPath = path.join(__dirname, "preload.js");
 
   mainWindow = new BrowserWindow({
-    width: 1280,
-    height: 880,
-    minWidth: 960,
-    minHeight: 680,
+    width: 1024,
+    height: 700,
+    minWidth: 800,
+    minHeight: 600,
     backgroundColor: "#050814",
     title: "DISTORT",
     show: false,

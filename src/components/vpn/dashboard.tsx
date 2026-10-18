@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Power, Server as ServerIcon, Gauge, BarChart3, Settings as Cog, User, X, ChevronLeft, Shield, Globe2, AlertTriangle } from "lucide-react";
+import { Power, Server as ServerIcon, Gauge, BarChart3, Settings as Cog, User, X, ChevronLeft, Shield, Globe2, AlertTriangle, HelpCircle } from "lucide-react";
 import { DistortWordmark } from "./distort-logo";
 import { ConnectView } from "./connect-view";
 import { ServerListView } from "./server-list-view";
@@ -16,17 +16,17 @@ import { UpdateIndicator } from "./update-indicator";
 import { useVpnStore } from "@/lib/vpn-store";
 import { Button } from "@/components/ui/button";
 
-type View = "connect" | "servers" | "mesh" | "emergency" | "speedtest" | "stats" | "settings" | "account";
+type View = "connect" | "servers" | "mesh" | "emergency" | "speedtest" | "stats" | "settings" | "account" | "help";
 
 const NAV: Array<{ id: View; label: string; icon: ReactNode; tag?: string }> = [
   { id: "connect", label: "Connect", icon: <Power className="w-4 h-4" /> },
   { id: "servers", label: "Servers", icon: <ServerIcon className="w-4 h-4" /> },
   { id: "mesh", label: "Distort Config", icon: <Globe2 className="w-4 h-4" />, tag: "Iran" },
-  { id: "emergency", label: "Emergency", icon: <AlertTriangle className="w-4 h-4" />, tag: "Beta" },
   { id: "speedtest", label: "Speed Test", icon: <Gauge className="w-4 h-4" /> },
   { id: "stats", label: "Statistics", icon: <BarChart3 className="w-4 h-4" /> },
   { id: "settings", label: "Settings", icon: <Cog className="w-4 h-4" /> },
   { id: "account", label: "Account", icon: <User className="w-4 h-4" /> },
+  { id: "help", label: "Help", icon: <HelpCircle className="w-4 h-4" /> },
 ];
 
 export function Dashboard({ onClose }: { onClose: () => void }) {
@@ -131,6 +131,7 @@ export function Dashboard({ onClose }: { onClose: () => void }) {
               {view === "stats" && <StatsView />}
               {view === "settings" && <SettingsView />}
               {view === "account" && <AccountView />}
+              {view === "help" && <HelpView />}
             </motion.div>
           </AnimatePresence>
         </div>
@@ -152,6 +153,133 @@ function StatusPill({ state, server }: { state: string; server?: string }) {
       </div>
       <div className="text-sm font-semibold text-white capitalize">{state}</div>
       {server && <div className="text-[11px] text-muted-foreground truncate">via {server}</div>}
+    </div>
+  );
+}
+
+function HelpView() {
+  return (
+    <div className="space-y-6 pb-8">
+      <div>
+        <h2 className="text-2xl font-bold text-white">Help & About</h2>
+        <p className="text-xs text-muted-foreground mt-1">Version info, updates, and troubleshooting</p>
+      </div>
+
+      <div className="bg-card border border-white/5 rounded-xl p-6 space-y-4">
+        <div className="flex items-center gap-4">
+          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-[#00f0ff] to-[#2962ff] flex items-center justify-center">
+            <span className="text-3xl font-bold text-[#050814]">D</span>
+          </div>
+          <div>
+            <h3 className="text-xl font-bold text-white">DISTORT</h3>
+            <p className="text-sm text-muted-foreground">Freedom Beyond Borders</p>
+            <p className="text-xs text-[#5cf2ff] font-tech mt-1">v1.0.20 · 100% Free · MIT</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="bg-card border border-white/5 rounded-xl p-4">
+          <h4 className="text-sm font-tech uppercase tracking-wider text-[#5cf2ff] mb-2">Check for Updates</h4>
+          <p className="text-xs text-muted-foreground mb-3">Check if a new version is available.</p>
+          <UpdateCheckButton />
+        </div>
+
+        <div className="bg-card border border-white/5 rounded-xl p-4">
+          <h4 className="text-sm font-tech uppercase tracking-wider text-[#5cf2ff] mb-2">System Status</h4>
+          <p className="text-xs text-muted-foreground mb-3">Check if all services are running.</p>
+          <SystemStatusButton />
+        </div>
+      </div>
+
+      <div className="bg-card border border-white/5 rounded-xl p-4">
+        <h4 className="text-sm font-tech uppercase tracking-wider text-[#5cf2ff] mb-3">Quick Links</h4>
+        <div className="space-y-2">
+          <a href="https://github.com/di6tort-bit/distort" target="_blank" rel="noopener noreferrer" className="block text-sm text-muted-foreground hover:text-[#00f0ff] transition-colors">
+            → GitHub Repository
+          </a>
+          <a href="https://github.com/di6tort-bit/distort/releases" target="_blank" rel="noopener noreferrer" className="block text-sm text-muted-foreground hover:text-[#00f0ff] transition-colors">
+            → Download Latest Release
+          </a>
+          <a href="https://github.com/di6tort-bit/distort/issues" target="_blank" rel="noopener noreferrer" className="block text-sm text-muted-foreground hover:text-[#00f0ff] transition-colors">
+            → Report a Bug
+          </a>
+        </div>
+      </div>
+
+      <div className="bg-card border border-white/5 rounded-xl p-4">
+        <h4 className="text-sm font-tech uppercase tracking-wider text-[#5cf2ff] mb-3">Troubleshooting</h4>
+        <div className="space-y-2 text-xs text-muted-foreground">
+          <p>• If the dashboard doesn't load: wait 15 seconds for the server to start.</p>
+          <p>• If connect fails: check that the desktop companion is running (port 10810).</p>
+          <p>• If IP shows error: the server may not have internet access.</p>
+          <p>• Logs location: <code className="text-[#5cf2ff]">%APPDATA%\DISTORT\logs\main.log</code></p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UpdateCheckButton() {
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+
+  const handleCheck = async () => {
+    setChecking(true);
+    setResult(null);
+    try {
+      const w = window as unknown as { distort?: { updater?: { checkNow: () => Promise<{ ok: boolean; error?: string }> } } };
+      if (w.distort?.updater?.checkNow) {
+        const r = await w.distort.updater.checkNow();
+        setResult(r.ok ? "Check complete — see notification" : `Error: ${r.error}`);
+      } else {
+        setResult("Auto-update not available in this build. Check GitHub releases manually.");
+      }
+    } catch (e) {
+      setResult(`Error: ${(e as Error).message}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  return (
+    <Button onClick={handleCheck} disabled={checking} size="sm" variant="outline" className="w-full">
+      {checking ? "Checking…" : "Check Now"}
+      {result && <span className="block text-[10px] text-muted-foreground mt-1">{result}</span>}
+    </Button>
+  );
+}
+
+function SystemStatusButton() {
+  const [status, setStatus] = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleCheck = async () => {
+    setLoading(true);
+    try {
+      const resp = await fetch("/api/diagnostic");
+      if (resp.ok) {
+        setStatus(await resp.json());
+      } else {
+        setStatus({ error: `HTTP ${resp.status}` });
+      }
+    } catch (e) {
+      setStatus({ error: (e as Error).message });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div>
+      <Button onClick={handleCheck} disabled={loading} size="sm" variant="outline" className="w-full">
+        {loading ? "Checking…" : "Run Diagnostic"}
+      </Button>
+      {status && (
+        <pre className="mt-2 text-[10px] text-muted-foreground bg-black/30 rounded p-2 overflow-auto max-h-40">
+          {JSON.stringify(status, null, 2)}
+        </pre>
+      )}
     </div>
   );
 }

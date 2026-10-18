@@ -86,8 +86,8 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
         const uriData = await uriResp.json();
         const configUri = uriData.uri;
 
-        // Try to start tunnel via companion API
-        const companionResp = await fetch("http://127.0.0.1:10810/api/tunnel/start", {
+        // Try to start tunnel via Next.js API proxy (avoids CORS)
+        const companionResp = await fetch("/api/tunnel/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ configUri }),
@@ -157,7 +157,7 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     } else if (state === "connected") {
       disconnect();
       try {
-        await fetch("http://127.0.0.1:10810/api/tunnel/stop", { method: "POST" });
+        await fetch("/api/tunnel/stop", { method: "POST" });
       } catch {}
       try {
         await postJSON("/api/connect", {
