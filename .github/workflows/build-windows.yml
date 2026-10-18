@@ -4,6 +4,8 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+permissions:
+  contents: write  # Required for electron-builder to create releases + upload assets
 jobs:
   build-windows:
     runs-on: windows-latest
