@@ -1,12 +1,31 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Power, Shield, ShieldCheck, Zap, Activity, Globe2, Radio, Lock } from "lucide-react";
-import { useVpnStore, formatRate, formatBytes, formatDuration, type ServerLite, isDemoMode } from "@/lib/vpn-store";
-import { postJSON } from "@/hooks/use-fetch";
+import {
+  Power, Shield, Zap, Activity, Radio, RefreshCw,
+  ChevronDown, Check, Download, Upload, Clock, Wifi,
+  AlertCircle, Settings2, Crown
+} from "lucide-react";
+import { useVpnStore, formatRate, formatBytes, formatDuration, type ServerLite } from "@/lib/vpn-store";
+import { postJSON, useFetch } from "@/hooks/use-fetch";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { toast } from "sonner";
+import { useAutoUpdate } from "@/hooks/use-auto-update";
+
+type IranConfig = {
+  id: string;
+  protocol: string;
+  host: string;
+  port: number;
+  score: number;
+  flags: string;
+  label: string | null;
+  country: string | null;
+  reach: string;
+  latencyMs: number;
+};
 
 function pingColor(p: number) {
   if (p === 0) return "#8aa0c4";
@@ -18,6 +37,17 @@ function pingColor(p: number) {
 export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
   const { state, currentServer, live, settings, connect, disconnect } = useVpnStore();
   const [now, setNow] = useState(Date.now());
+  const [showConfigList, setShowConfigList] = useState(false);
+  const [selectedConfig, setSelectedConfig] = useState<IranConfig | null>(null);
+  const [connecting, setConnecting] = useState(false);
+
+  // Fetch Iran configs
+  const { data: configData, loading: configsLoading, refetch: refetchConfigs } = useFetch<{ configs: IranConfig[] }>(
+    "/api/imported-configs?bucket=optimized&limit=10"
+  );
+
+  // Auto-update
+  const { status: updateStatus, version: updateVersion, checkNow, isDesktop } = useAutoUpdate();
 
   useEffect(() => {
     if (state !== "connected") return;
@@ -26,219 +56,378 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
   }, [state]);
 
   const elapsed = live.connectedSince ? Math.floor((now - live.connectedSince) / 1000) : 0;
-
   const isConnected = state === "connected";
-  const isConnecting = state === "connecting";
+  const isConnecting = state === "connecting" || connecting;
+
+  // Auto-select first config
+  useEffect(() => {
+    if (!selectedConfig && configData?.configs?.length) {
+      const firstReachable = configData.configs.find(c => c.reach === "ok") || configData.configs[0];
+      setSelectedConfig(firstReachable);
+    }
+  }, [configData, selectedConfig]);
 
   const handleToggle = async () => {
     if (state === "disconnected" || state === "error") {
-      if (!currentServer) {
-        onPickServer();
+      if (!selectedConfig) {
+        toast.error("No config selected", { description: "Refresh configs and try again." });
         return;
       }
-      connect(currentServer as ServerLite, settings.protocol);
+
+      // Try real connection via companion API
+      setConnecting(true);
       try {
-        await postJSON("/api/connect", {
-          serverId: (currentServer as ServerLite).id,
-          protocol: settings.protocol,
-          action: "connect",
+        // First, fetch the config URI
+        const uriResp = await fetch(`/api/emergency/candidates/${selectedConfig.id}/uri`, { method: "POST" });
+        if (!uriResp.ok) {
+          throw new Error(`Failed to fetch config URI (${uriResp.status})`);
+        }
+        const uriData = await uriResp.json();
+        const configUri = uriData.uri;
+
+        // Try to start tunnel via companion API
+        const companionResp = await fetch("http://127.0.0.1:10810/api/tunnel/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ configUri }),
         });
-      } catch {
-        /* UI still simulates locally */
+
+        if (companionResp.ok) {
+          const result = await companionResp.json();
+          if (result.ok) {
+            connect({
+              id: selectedConfig.id,
+              code: selectedConfig.host,
+              country: selectedConfig.country || "Iran",
+              city: selectedConfig.host,
+              flag: "🇮🇷",
+              host: selectedConfig.host,
+              port: selectedConfig.port,
+              protocols: selectedConfig.protocol,
+              load: 0,
+              ping: selectedConfig.latencyMs || 50,
+              upMbps: 1000,
+              downMbps: 1000,
+              online: true,
+              premium: false,
+              stealth: true,
+              note: selectedConfig.flags,
+            } as ServerLite, selectedConfig.protocol);
+            toast.success("Connecting…", { description: `${selectedConfig.protocol} → ${selectedConfig.host}:${selectedConfig.port}` });
+          } else {
+            throw new Error(result.error || "Tunnel failed to start");
+          }
+        } else {
+          // Companion API not available — fall back to demo mode
+          connect({
+            id: selectedConfig.id,
+            code: selectedConfig.host,
+            country: selectedConfig.country || "Iran",
+            city: selectedConfig.host,
+            flag: "🇮🇷",
+            host: selectedConfig.host,
+            port: selectedConfig.port,
+            protocols: selectedConfig.protocol,
+            load: 0,
+            ping: selectedConfig.latencyMs || 50,
+            upMbps: 1000,
+            downMbps: 1000,
+            online: true,
+            premium: false,
+            stealth: true,
+            note: selectedConfig.flags,
+          } as ServerLite, selectedConfig.protocol);
+          toast.info("Demo mode", { description: "Install the desktop app for real VPN tunneling. Using simulated connection." });
+        }
+
+        // Create session record
+        try {
+          await postJSON("/api/connect", {
+            serverId: selectedConfig.id,
+            protocol: selectedConfig.protocol,
+            action: "connect",
+          });
+        } catch {}
+      } catch (e) {
+        toast.error("Connection failed", { description: (e as Error).message });
+      } finally {
+        setConnecting(false);
       }
     } else if (state === "connected") {
       disconnect();
       try {
-        await postJSON("/api/connect", { action: "disconnect" });
-      } catch {
-        /* ignore */
-      }
+        await fetch("http://127.0.0.1:10810/api/tunnel/stop", { method: "POST" });
+      } catch {}
+      try {
+        await postJSON("/api/connect", {
+          serverId: selectedConfig?.id || "",
+          protocol: selectedConfig?.protocol || "wireguard",
+          action: "disconnect",
+        });
+      } catch {}
     }
   };
 
-  const climateLevel = isConnected ? "safe" : isConnecting ? "degraded" : "hostile";
-  const climateLabel =
-    climateLevel === "safe"
-      ? "Open internet · secure tunnel active"
-      : climateLevel === "degraded"
-      ? "Establishing encrypted tunnel…"
-      : "National filtering detected · stealth recommended";
+  const handleRefresh = async () => {
+    toast.info("Refreshing configs…");
+    try {
+      // Trigger subscription refresh
+      const resp = await fetch("/api/subscriptions", { method: "GET" });
+      if (resp.ok) {
+        const data = await resp.json();
+        const subs = data.subscriptions || [];
+        for (const sub of subs) {
+          await fetch(`/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
+        }
+      }
+      refetchConfigs();
+      toast.success("Configs refreshed", { description: "Latest Iran configs loaded." });
+    } catch {
+      toast.error("Refresh failed");
+    }
+  };
+
+  const handleCheckUpdate = async () => {
+    toast.info("Checking for updates…");
+    const r = await checkNow();
+    if (r.ok) {
+      toast.success("Check complete", { description: updateStatus === "available" ? `Update v${updateVersion} available!` : "You're up to date." });
+    } else {
+      toast.error("Update check failed", { description: r.error });
+    }
+  };
 
   return (
-    <div className="relative flex flex-col items-center justify-center py-8 px-4">
-      <div className="mesh-bg" />
-      <div className="relative z-10 w-full max-w-md mx-auto flex flex-col items-center">
-        {/* Demo mode badge (shown when not in Electron desktop app) */}
-        {isDemoMode() && (
-          <div className="mb-4 px-3 py-1.5 rounded-lg bg-[#ffb020]/10 border border-[#ffb020]/30 text-[#ffb020] text-[10px] font-tech uppercase tracking-[0.2em] flex items-center gap-1.5">
-            <Shield className="w-3 h-3" />
-            Demo mode — download the desktop app for real VPN tunneling
-          </div>
-        )}
-        {/* Climate line */}
-        <div className="mb-6 flex items-center gap-2 text-xs font-tech uppercase tracking-[0.2em] text-muted-foreground">
-          <span
-            className={`dot-live inline-block w-2 h-2 rounded-full ${
-              climateLevel === "safe" ? "bg-[#10d9a0] text-[#10d9a0]" : climateLevel === "degraded" ? "bg-[#ffb020] text-[#ffb020]" : "bg-[#ff4d6d] text-[#ff4d6d]"
-            }`}
-          />
-          <span>{climateLabel}</span>
+    <div className="space-y-6 pb-8">
+      {/* --- Header: version + update status --- */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-bold text-white">Connect</h2>
+          <p className="text-xs text-muted-foreground mt-1 font-tech uppercase tracking-wider">
+            One tap to freedom
+          </p>
         </div>
-
-        {/* Power button */}
-        <div className="relative flex items-center justify-center w-[280px] h-[280px] my-4">
-          {/* Outer rings */}
-          <div className="absolute inset-0 rounded-full border border-white/5" />
-          <div className="absolute inset-6 rounded-full border border-white/5" />
-          <div className="absolute inset-12 rounded-full border border-white/10" />
-
-          <AnimatePresence>
-            {isConnected && (
+        <div className="flex items-center gap-2">
+          {/* Version + update button */}
+          <button
+            onClick={handleCheckUpdate}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#00f0ff]/30 transition-colors text-xs text-muted-foreground hover:text-white"
+            title="Check for updates"
+          >
+            {updateStatus === "available" ? (
               <>
-                <span className="pulse-ring" />
-                <span className="pulse-ring" />
-                <span className="pulse-ring" />
+                <Download className="w-3 h-3 text-[#10d9a0] animate-pulse" />
+                <span className="text-[#10d9a0] font-tech">v{updateVersion} ready</span>
+              </>
+            ) : updateStatus === "downloading" ? (
+              <>
+                <RefreshCw className="w-3 h-3 animate-spin text-[#00f0ff]" />
+                <span className="text-[#00f0ff] font-tech">Downloading…</span>
+              </>
+            ) : (
+              <>
+                <RefreshCw className="w-3 h-3" />
+                <span className="font-tech">Check updates</span>
               </>
             )}
-          </AnimatePresence>
+          </button>
 
-          {isConnecting && (
-            <div className="absolute inset-4 rounded-full conic-spinner opacity-70" style={{ mask: "radial-gradient(transparent 58%, black 60%)", WebkitMask: "radial-gradient(transparent 58%, black 60%)" }} />
+          {/* Refresh configs button */}
+          <button
+            onClick={handleRefresh}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#00f0ff]/30 transition-colors text-xs text-muted-foreground hover:text-white"
+            title="Refresh Iran configs"
+          >
+            <RefreshCw className={`w-3 h-3 ${configsLoading ? "animate-spin" : ""}`} />
+            <span className="font-tech">Refresh</span>
+          </button>
+        </div>
+      </div>
+
+      {/* --- Big Connect button --- */}
+      <div className="flex justify-center py-8">
+        <motion.button
+          onClick={handleToggle}
+          whileTap={{ scale: 0.95 }}
+          className={`relative w-48 h-48 rounded-full flex flex-col items-center justify-center transition-all duration-300 ${
+            isConnected
+              ? "bg-gradient-to-br from-[#10d9a0] to-[#0d7a6d] shadow-[0_0_60px_rgba(16,217,160,0.4)]"
+              : isConnecting
+              ? "bg-gradient-to-br from-[#ffb020] to-[#d4880f] shadow-[0_0_40px_rgba(255,176,32,0.3)]"
+              : "bg-card border border-white/10 hover:border-[#00f0ff]/50 shadow-[0_0_30px_rgba(0,240,255,0.1)]"
+          }`}
+          aria-label={isConnected ? "Disconnect VPN" : "Connect VPN"}
+        >
+          {/* Pulse rings when connected */}
+          {isConnected && (
+            <>
+              <div className="absolute inset-0 rounded-full border-2 border-[#10d9a0] animate-ping opacity-20" />
+              <div className="absolute -inset-2 rounded-full border border-[#10d9a0]/30 animate-pulse" />
+            </>
           )}
 
-          <motion.button
-            onClick={handleToggle}
-            whileHover={{ scale: 1.03 }}
-            whileTap={{ scale: 0.97 }}
-            className={`relative z-10 w-44 h-44 rounded-full flex flex-col items-center justify-center gap-2 transition-all duration-300 ${
-              isConnected
-                ? "bg-brand-gradient ring-glow"
-                : isConnecting
-                ? "bg-card border border-[#00f0ff]/40"
-                : "bg-card border border-white/10 hover:border-[#00f0ff]/50"
-            }`}
-            aria-label={isConnected ? "Disconnect VPN" : "Connect VPN"}
-          >
-            <Power
-              className={`w-12 h-12 ${isConnected ? "text-[#02131a]" : "text-[#00f0ff]"}`}
-              strokeWidth={2.2}
-            />
-            <span className={`font-tech uppercase tracking-[0.3em] text-xs ${isConnected ? "text-[#02131a]" : "text-muted-foreground"}`}>
-              {isConnected ? "Connected" : isConnecting ? "Connecting" : "Tap to Connect"}
-            </span>
-          </motion.button>
-        </div>
+          <Power
+            className={`w-12 h-12 ${isConnected ? "text-[#02131a]" : "text-[#00f0ff]"}`}
+            strokeWidth={2.2}
+          />
+          <span className={`font-tech uppercase tracking-[0.3em] text-xs mt-2 ${
+            isConnected ? "text-[#02131a]" : isConnecting ? "text-[#02131a]" : "text-muted-foreground"
+          }`}>
+            {isConnected ? "Connected" : isConnecting ? "Connecting…" : "Tap to Connect"}
+          </span>
+        </motion.button>
+      </div>
 
-        {/* Status card */}
-        <div className="w-full glass-strong rounded-2xl p-5 mt-4 scanline">
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <Globe2 className="w-4 h-4 text-[#00f0ff]" />
-              <span className="font-tech uppercase tracking-[0.2em] text-xs text-muted-foreground">Current Server</span>
-            </div>
-            <Badge variant="outline" className="border-[#00f0ff]/30 text-[#5cf2ff] font-tech uppercase tracking-wider text-[10px]">
-              {settings.protocol}
-            </Badge>
-          </div>
-
-          {currentServer ? (
-            <button onClick={onPickServer} className="w-full text-left group">
-              <div className="flex items-center gap-3">
-                <span className="text-3xl">{currentServer.flag}</span>
-                <div className="flex-1 min-w-0">
-                  <div className="font-display text-lg font-bold text-white truncate">
-                    {currentServer.country}
-                  </div>
-                  <div className="text-xs text-muted-foreground font-tech uppercase tracking-wider truncate">
-                    {currentServer.city} · {currentServer.code}
-                  </div>
+      {/* --- Selected server card --- */}
+      <div className="bg-card border border-white/5 rounded-xl p-4">
+        {selectedConfig ? (
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-[#00f0ff]/10 flex items-center justify-center">
+                <span className="text-lg">🇮🇷</span>
+              </div>
+              <div>
+                <div className="text-sm font-semibold text-white">
+                  {selectedConfig.protocol.toUpperCase()} · {selectedConfig.host}:{selectedConfig.port}
                 </div>
-                <div className="text-right">
-                  <div className="font-mono text-sm font-semibold" style={{ color: pingColor(currentServer.ping) }}>
-                    {currentServer.ping}ms
-                  </div>
-                  {currentServer.stealth && (
-                    <div className="flex items-center gap-1 justify-end mt-0.5">
-                      <Shield className="w-3 h-3 text-[#8b5cf6]" />
-                      <span className="text-[10px] text-[#8b5cf6] font-tech uppercase tracking-wider">Stealth</span>
-                    </div>
+                <div className="text-xs text-muted-foreground flex items-center gap-2 mt-0.5">
+                  {selectedConfig.flags && (
+                    <Badge variant="outline" className="text-[9px] py-0 px-1.5 border-[#8b5cf6]/30 text-[#8b5cf6]">
+                      {selectedConfig.flags.split(",")[0]}
+                    </Badge>
+                  )}
+                  <span>Score: {selectedConfig.score}</span>
+                  {selectedConfig.reach === "ok" && (
+                    <span className="text-[#10d9a0]">✓ reachable</span>
                   )}
                 </div>
               </div>
-            </button>
-          ) : (
-            <button onClick={onPickServer} className="w-full py-3 text-center text-sm text-muted-foreground hover:text-[#00f0ff] transition-colors">
-              Select a server →
-            </button>
-          )}
-
-          {/* Live metrics */}
-          {isConnected && (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              className="grid grid-cols-3 gap-2 mt-4 pt-4 border-t border-white/5"
+            </div>
+            <button
+              onClick={() => setShowConfigList(!showConfigList)}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] text-xs text-muted-foreground hover:text-white transition-colors"
             >
-              <Metric icon={<Activity className="w-3 h-3" />} label="Down" value={formatRate(live.downBps)} color="#10d9a0" />
-              <Metric icon={<Radio className="w-3 h-3" />} label="Up" value={formatRate(live.upBps)} color="#00f0ff" />
-              <Metric icon={<Zap className="w-3 h-3" />} label="Ping" value={`${live.ping}ms`} color="#ffb020" />
+              Change
+              <ChevronDown className={`w-3 h-3 transition-transform ${showConfigList ? "rotate-180" : ""}`} />
+            </button>
+          </div>
+        ) : (
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-muted-foreground">
+              {configsLoading ? "Loading configs…" : "No config selected"}
+            </div>
+            <button
+              onClick={() => setShowConfigList(!showConfigList)}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] text-xs text-muted-foreground hover:text-white transition-colors"
+            >
+              Select config
+              <ChevronDown className={`w-3 h-3 transition-transform ${showConfigList ? "rotate-180" : ""}`} />
+            </button>
+          </div>
+        )}
 
-              {/* Exit IP + Country — shows which country's IP we're connected through */}
-              {live.exitIp && (
-                <div className="col-span-3 mt-2 p-3 rounded-lg bg-[#00f0ff]/[0.06] border border-[#00f0ff]/20">
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div className="text-[10px] font-tech uppercase tracking-wider text-[#5cf2ff] mb-1">Exit IP (verified)</div>
-                      <div className="font-mono text-sm text-white">{live.exitIp}</div>
-                    </div>
-                    {live.exitCountry && (
-                      <div className="text-right">
-                        <div className="text-[10px] font-tech uppercase tracking-wider text-muted-foreground mb-1">Country</div>
-                        <div className="text-lg font-bold text-[#10d9a0]">{live.exitCountry}</div>
+        {/* Config dropdown */}
+        <AnimatePresence>
+          {showConfigList && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden"
+            >
+              <div className="mt-3 pt-3 border-t border-white/5 space-y-1 max-h-64 overflow-y-auto">
+                {configData?.configs?.map((cfg) => (
+                  <button
+                    key={cfg.id}
+                    onClick={() => {
+                      setSelectedConfig(cfg);
+                      setShowConfigList(false);
+                    }}
+                    className={`w-full flex items-center justify-between p-3 rounded-lg transition-colors text-left ${
+                      selectedConfig?.id === cfg.id
+                        ? "bg-[#00f0ff]/10 border border-[#00f0ff]/20"
+                        : "hover:bg-white/[0.03] border border-transparent"
+                    }`}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="text-xs font-mono text-[#5cf2ff] uppercase">{cfg.protocol}</div>
+                      <div>
+                        <div className="text-sm text-white">{cfg.host}:{cfg.port}</div>
+                        <div className="text-[10px] text-muted-foreground">
+                          {cfg.flags || "no flags"} · score {cfg.score}
+                        </div>
                       </div>
-                    )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {cfg.reach === "ok" && (
+                        <span className="text-[10px] text-[#10d9a0]">✓</span>
+                      )}
+                      {selectedConfig?.id === cfg.id && (
+                        <Check className="w-4 h-4 text-[#00f0ff]" />
+                      )}
+                    </div>
+                  </button>
+                ))}
+                {configData?.configs?.length === 0 && (
+                  <div className="text-center text-sm text-muted-foreground py-4">
+                    No configs available. Click "Refresh" to fetch Iran configs.
                   </div>
-                </div>
-              )}
-              <Metric icon={<Activity className="w-3 h-3" />} label="Session" value={formatDuration(elapsed)} color="#8b5cf6" />
-              <Metric icon={<Lock className="w-3 h-3" />} label="Downloaded" value={formatBytes(live.totalDown)} color="#eaf2ff" />
-              <Metric icon={<Lock className="w-3 h-3" />} label="Uploaded" value={formatBytes(live.totalUp)} color="#eaf2ff" />
+                )}
+              </div>
             </motion.div>
           )}
-        </div>
-
-        {/* Quick toggles */}
-        <div className="w-full grid grid-cols-3 gap-2 mt-3">
-          <QuickToggle label="Kill Switch" on={settings.killSwitch} icon={<ShieldCheck className="w-3.5 h-3.5" />} />
-          <QuickToggle label="Stealth" on={settings.stealthMode} icon={<Shield className="w-3.5 h-3.5" />} />
-          <QuickToggle label="No Trackers" on={settings.blockTrackers} icon={<Lock className="w-3.5 h-3.5" />} />
-        </div>
+        </AnimatePresence>
       </div>
+
+      {/* --- Live metrics (when connected) --- */}
+      {isConnected && (
+        <motion.div
+          initial={{ opacity: 0, height: 0 }}
+          animate={{ opacity: 1, height: "auto" }}
+          className="grid grid-cols-2 sm:grid-cols-4 gap-3"
+        >
+          <MetricCard icon={<Download className="w-4 h-4" />} label="Download" value={formatRate(live.downBps)} color="#10d9a0" />
+          <MetricCard icon={<Upload className="w-4 h-4" />} label="Upload" value={formatRate(live.upBps)} color="#00f0ff" />
+          <MetricCard icon={<Activity className="w-4 h-4" />} label="Ping" value={`${live.ping}ms`} color="#ffb020" />
+          <MetricCard icon={<Clock className="w-4 h-4" />} label="Session" value={formatDuration(elapsed)} color="#8b5cf6" />
+        </motion.div>
+      )}
+
+      {/* --- Quick toggles --- */}
+      <div className="flex flex-wrap gap-2">
+        {settings.killSwitch && (
+          <Badge variant="outline" className="border-[#ff4d6d]/30 text-[#ff4d6d] text-xs">Kill Switch</Badge>
+        )}
+        {settings.stealthMode && (
+          <Badge variant="outline" className="border-[#8b5cf6]/30 text-[#8b5cf6] text-xs">Stealth</Badge>
+        )}
+        {settings.blockTrackers && (
+          <Badge variant="outline" className="border-[#10d9a0]/30 text-[#10d9a0] text-xs">No Trackers</Badge>
+        )}
+      </div>
+
+      {/* --- Desktop companion status --- */}
+      {!isDesktop && (
+        <div className="flex items-center gap-2 text-xs text-[#ffb020] bg-[#ffb020]/5 border border-[#ffb020]/10 rounded-lg p-3">
+          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          <span>
+            Desktop companion not detected. Real VPN tunneling requires the desktop app.
+            The connection will work in demo mode (simulated speeds).
+          </span>
+        </div>
+      )}
     </div>
   );
 }
 
-function Metric({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: string; color: string }) {
+function MetricCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: string; color: string }) {
   return (
-    <div className="rounded-lg bg-white/[0.03] border border-white/5 px-2.5 py-2">
-      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground font-tech" style={{ color }}>
-        {icon}
-        {label}
+    <div className="bg-card border border-white/5 rounded-lg p-3">
+      <div className="flex items-center gap-1.5 mb-1">
+        <span style={{ color }}>{icon}</span>
+        <span className="text-[10px] font-tech uppercase tracking-wider text-muted-foreground">{label}</span>
       </div>
-      <div className="font-mono text-sm font-semibold mt-0.5 text-white truncate">{value}</div>
-    </div>
-  );
-}
-
-function QuickToggle({ label, on, icon }: { label: string; on: boolean; icon: React.ReactNode }) {
-  return (
-    <div
-      className={`rounded-lg border px-3 py-2 flex items-center gap-2 transition-colors ${
-        on ? "border-[#00f0ff]/30 bg-[#00f0ff]/[0.06] text-[#5cf2ff]" : "border-white/5 bg-white/[0.02] text-muted-foreground"
-      }`}
-    >
-      {icon}
-      <span className="text-[11px] font-tech uppercase tracking-wider truncate">{label}</span>
+      <div className="text-sm font-mono font-semibold text-white">{value}</div>
     </div>
   );
 }
