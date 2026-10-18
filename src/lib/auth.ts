@@ -32,7 +32,19 @@ export function isAuthConfigured(): boolean {
 }
 
 export function checkAuth(req: NextRequest): NextResponse | null {
-  // In production, API key MUST be set. If not, refuse to serve.
+  // DESKTOP MODE: if the request comes from localhost (the bundled desktop
+  // app's Next.js server), bypass auth entirely. The desktop app runs on
+  // the user's machine and there's no remote attacker to protect against.
+  // This fixes the bug where subscriptions POST / imported-configs DELETE
+  // returned 503 in the desktop app because DISTORT_API_KEY wasn't set.
+  const host = req.headers.get("host") || "";
+  const isLocalhost = host.startsWith("127.0.0.1") || host.startsWith("localhost") || host.startsWith("::1");
+  if (isLocalhost && !isAuthConfigured()) {
+    // Localhost + no API key configured = desktop app mode — allow all
+    return null;
+  }
+
+  // In production (remote deployment), API key MUST be set. If not, refuse to serve.
   if (IS_PRODUCTION && !isAuthConfigured()) {
     return NextResponse.json(
       {

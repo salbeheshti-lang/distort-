@@ -2307,6 +2307,62 @@ function startNextServer(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-fetch Community Mesh subscription on first run
+// ---------------------------------------------------------------------------
+// After the Next.js server is ready, fetch the Iran config subscription so
+// that Quick Connect has configs to try. This is called once 5 seconds after
+// the server starts, and only fetches if there are fewer than 10 configs in
+// the DB (i.e., first run or after a reset).
+async function autoFetchSubscription(): Promise<void> {
+  try {
+    // Wait a bit for the server to be fully ready
+    await new Promise((r) => setTimeout(r, 5000));
+
+    // Check if we already have configs — if so, skip
+    const countRes = await fetch("http://127.0.0.1:38571/api/imported-configs?limit=1");
+    if (countRes.ok) {
+      const countData = await countRes.json() as { configs: unknown[] };
+      if (countData.configs && countData.configs.length > 0) {
+        log.info("Auto-fetch: configs already exist — skipping subscription fetch");
+        return;
+      }
+    }
+
+    // Get the subscription list
+    const subsRes = await fetch("http://127.0.0.1:38571/api/subscriptions");
+    if (!subsRes.ok) {
+      log.warn(`Auto-fetch: could not list subscriptions (${subsRes.status})`);
+      return;
+    }
+    const subsData = await subsRes.json() as { subscriptions: Array<{ id: string; url: string; label: string }> };
+    const subs = subsData.subscriptions || [];
+
+    if (subs.length === 0) {
+      log.info("Auto-fetch: no subscriptions in DB — nothing to fetch");
+      return;
+    }
+
+    // Refresh each subscription (usually just one — the Iran config collector)
+    for (const sub of subs) {
+      log.info(`Auto-fetch: refreshing "${sub.label}" (${sub.url})`);
+      const refreshRes = await fetch(`http://127.0.0.1:38571/api/subscriptions/${sub.id}/refresh`, {
+        method: "POST",
+      });
+      if (refreshRes.ok) {
+        const refreshData = await refreshRes.json() as { count?: number };
+        log.info(`Auto-fetch: "${sub.label}" refreshed — ${refreshData.count || 0} configs`);
+      } else {
+        log.warn(`Auto-fetch: refresh failed for "${sub.label}" (${refreshRes.status})`);
+      }
+    }
+
+    log.info("Auto-fetch: subscription fetch complete — Quick Connect is ready");
+  } catch (e: any) {
+    log.warn(`Auto-fetch: failed (non-fatal): ${e?.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Single-instance lock — prevents multiple DISTORT instances from running.
 // Without this, every click on the app icon spawns a new instance, each
 // trying to start its own Next.js server on port 38571 (which fails for all
@@ -2368,6 +2424,11 @@ app.whenReady().then(async () => {
 
   createWindow();
   createTray();
+
+  // Auto-fetch Community Mesh subscription on first run.
+  // This populates the Iran config list so Quick Connect has configs to try.
+  // Runs in the background — doesn't block app startup.
+  autoFetchSubscription().catch((e) => log.warn(`Auto-fetch failed: ${e?.message}`));
 
   // Start the companion control API on 127.0.0.1:10810.
   // This is what the BrowserWithCompanionEngine (in the web dashboard's
