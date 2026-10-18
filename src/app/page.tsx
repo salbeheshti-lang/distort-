@@ -7,11 +7,9 @@ import { SiteFooter } from "@/components/site-footer";
 import { Hero } from "@/components/landing/hero";
 import { Features } from "@/components/landing/features";
 import { DownloadSection } from "@/components/landing/download";
-import { ScreenshotGallery } from "@/components/landing/screenshot-gallery";
-import { NewScreenshotsGallery } from "@/components/landing/new-screenshots-gallery";
 import { Dashboard } from "@/components/vpn/dashboard";
 import { Button } from "@/components/ui/button";
-import { Server as ServerIcon, ArrowDown, Images } from "lucide-react";
+import { Server as ServerIcon, ArrowDown } from "lucide-react";
 
 export default function Home() {
   const [mode, setMode] = useState<"landing" | "app">(() =>
@@ -55,8 +53,6 @@ export default function Home() {
             >
               <Hero onLaunch={launchApp} />
               <Features />
-              <ScreenshotGallery />
-              <NewScreenshotsGallery />
               <ServersCta onLaunch={launchApp} />
               <DownloadSection onLaunch={launchApp} />
             </motion.div>
