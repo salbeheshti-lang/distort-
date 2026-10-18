@@ -78,4 +78,16 @@ if (existsSync(prismaClientSrc) && !existsSync(prismaClientDest)) {
   console.log("  ✓ Done");
 }
 
+// Copy schema.sql + seed.sql so the Next.js server can auto-migrate
+console.log("→ Copying schema.sql + seed.sql → .next/standalone/resources/db");
+const dbSrcDir = join(root, "desktop", "resources", "db");
+const dbDestDir = join(standaloneDir, "resources", "db");
+if (existsSync(dbSrcDir)) {
+  mkdirSync(dbDestDir, { recursive: true });
+  cpSync(dbSrcDir, dbDestDir, { recursive: true });
+  console.log("  ✓ Done");
+} else {
+  console.warn("  ⚠ desktop/resources/db not found — schema/seed SQL not bundled");
+}
+
 console.log("✓ Standalone bundle complete");

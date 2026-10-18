@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.14`);
+log.info(`App version: 1.0.15`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
