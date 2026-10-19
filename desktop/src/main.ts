@@ -12,7 +12,7 @@ import log from "electron-log";
 // Paths
 // ---------------------------------------------------------------------------
 const isDev = !!process.env.DISTORT_DEV;
-const APP_VERSION = "2.0.0";
+const APP_VERSION = "2.0.3";
 
 // Data directory: %APPDATA%\DISTORT on Windows
 const DATA_DIR = process.platform === "win32"
@@ -39,6 +39,7 @@ log.info("============================================================");
 // Config file (JSON, not SQLite)
 const CONFIG_FILE = join(DATA_DIR, "configs.json");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
+const STATS_FILE = join(DATA_DIR, "stats.json");
 
 // xray paths
 function getXrayPath(): string {
@@ -585,6 +586,130 @@ ipcMain.handle("settings:save", async (_e, settings: Settings) => {
 });
 
 ipcMain.handle("app:version", async () => APP_VERSION);
+
+// Open external links in system browser
+ipcMain.handle("shell:openExternal", async (_e, url: string) => {
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    shell.openExternal(url);
+  }
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------------------
+// Speed test (real download through proxy)
+// ---------------------------------------------------------------------------
+ipcMain.handle("speed:test", async () => {
+  try {
+    // Download a 10MB test file through the proxy
+    const testUrls = [
+      "https://speed.cloudflare.com/__down?bytes=10000000",
+      "https://www.google.com/generate_204",
+    ];
+
+    for (const url of testUrls) {
+      try {
+        const start = Date.now();
+        const resp = await fetch(url, {
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!resp.ok) continue;
+        const buf = await resp.arrayBuffer();
+        const elapsed = (Date.now() - start) / 1000;
+        const mbps = (buf.byteLength / 1024 / 1024 / elapsed).toFixed(1);
+        log.info(`[speed] ${url}: ${mbps} Mbps (${buf.byteLength} bytes in ${elapsed}s)`);
+        return { ok: true, downloadMbps: parseFloat(mbps), pingMs: Math.round(elapsed * 1000) };
+      } catch (e) {
+        // try next URL
+      }
+    }
+    return { ok: false, error: "Speed test failed — no test server responded" };
+  } catch (e: any) {
+    return { ok: false, error: e.message };
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tunnel status (is xray running?)
+// ---------------------------------------------------------------------------
+ipcMain.handle("tunnel:status", async () => {
+  return {
+    running: xrayProcess !== null && !xrayProcess.killed,
+    connected: xrayProcess !== null && !xrayProcess.killed,
+  };
+});
+
+// ---------------------------------------------------------------------------
+// Stats (load/save session history)
+// ---------------------------------------------------------------------------
+type Stats = {
+  totalDown: number;
+  totalUp: number;
+  totalSessions: number;
+  totalTime: number;
+  sessions: Array<{ startedAt: number; duration: number; bytes: number }>;
+};
+
+function loadStats(): Stats {
+  try {
+    if (existsSync(STATS_FILE)) {
+      return JSON.parse(readFileSync(STATS_FILE, "utf-8"));
+    }
+  } catch {}
+  return { totalDown: 0, totalUp: 0, totalSessions: 0, totalTime: 0, sessions: [] };
+}
+
+function saveStats(stats: Stats): void {
+  try { writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2)); } catch {}
+}
+
+ipcMain.handle("stats:get", async () => {
+  return loadStats();
+});
+
+ipcMain.handle("stats:reset", async () => {
+  const empty: Stats = { totalDown: 0, totalUp: 0, totalSessions: 0, totalTime: 0, sessions: [] };
+  saveStats(empty);
+  return { ok: true };
+});
+
+ipcMain.handle("stats:record", async (_e, data: { duration: number; bytes: number }) => {
+  const stats = loadStats();
+  stats.totalSessions++;
+  stats.totalTime += data.duration;
+  stats.totalDown += data.bytes;
+  stats.sessions.unshift({
+    startedAt: Date.now() - data.duration * 1000,
+    duration: data.duration,
+    bytes: data.bytes,
+  });
+  // Keep only last 50 sessions
+  if (stats.sessions.length > 50) stats.sessions = stats.sessions.slice(0, 50);
+  saveStats(stats);
+  return { ok: true };
+});
+
+// ---------------------------------------------------------------------------
+// Config search/filter
+// ---------------------------------------------------------------------------
+ipcMain.handle("configs:search", async (_e, query: string) => {
+  const configs = loadConfigs();
+  if (!query) return configs;
+  const q = query.toLowerCase();
+  return configs.filter(c =>
+    c.host.toLowerCase().includes(q) ||
+    c.protocol.toLowerCase().includes(q) ||
+    c.label.toLowerCase().includes(q) ||
+    c.flags.toLowerCase().includes(q)
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Delete all configs
+// ---------------------------------------------------------------------------
+ipcMain.handle("configs:clear", async () => {
+  saveConfigs([]);
+  return { ok: true };
+});
 
 // ---------------------------------------------------------------------------
 // App lifecycle
