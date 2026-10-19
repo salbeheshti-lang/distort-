@@ -171,9 +171,9 @@ export const useVpnStore = create<VpnStore>()(
             const s = get();
             if (s.state !== "connected") return;
 
-            // Try to read real speed from companion API (via Next.js proxy)
+            // Try to read real speed from companion API
             try {
-              const resp = await fetch("/api/tunnel/status");
+              const resp = await fetch("http://127.0.0.1:10810/api/tunnel/status");
               if (resp.ok) {
                 const data = await resp.json();
                 if (data.running && data.downBps !== undefined) {

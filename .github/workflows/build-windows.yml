@@ -5,7 +5,7 @@ on:
     tags: ['v*']
   workflow_dispatch:
 permissions:
-  contents: write
+  contents: write  # Required for electron-builder to create releases + upload assets
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -13,32 +13,64 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v1
         with: { bun-version: latest }
-
+      - name: Install root deps
+        run: bun install
+      - name: Generate Prisma client
+        run: bunx prisma generate
+      - name: Build Next.js (standalone + copy static)
+        run: bun run build
+        env:
+          DATABASE_URL: "file:/tmp/distort.db"
       - name: Install desktop deps
         working-directory: desktop
         run: bun install
-
+      - name: Generate icons
+        working-directory: desktop
+        run: bun run build-icons.mjs
       - name: Download xray-core (Windows)
         working-directory: desktop
         shell: bash
         run: |
           mkdir -p resources/bin
           cd resources/bin
+          # Pin to a specific version for reproducible builds.
+          # Update manually after verifying the new version works.
           XRAY_VERSION="v26.3.27"
           curl -fsSL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-windows-64.zip"
           unzip -o xray.zip
           rm xray.zip
+          # Verify wintun.dll is present (needed for TUN inbound)
+          if [ ! -f wintun.dll ]; then echo "ERROR: wintun.dll missing"; exit 1; fi
           if [ ! -f xray.exe ]; then echo "ERROR: xray.exe missing"; exit 1; fi
           echo "xray version: ${XRAY_VERSION}"
-
-      - name: Build desktop app
+          ls -la wintun.dll xray.exe
+      - name: Build desktop app (NSIS installer + portable)
         working-directory: desktop
         run: |
           bun run build:desktop
+          # Publish to GitHub Releases when a `v*` tag is pushed.
+          # --publish onTag means: only upload assets when the build was
+          # triggered by a tag push; for branch builds it just produces
+          # local artifacts (which we upload via actions/upload-artifact
+          # below for manual download / QA).
+          #
+          # GITHUB_TOKEN is provided automatically by GitHub Actions
+          # (secrets.GITHUB_TOKEN). electron-builder uses it to:
+          #   1. Query the Releases API
+          #   2. Create a new Release if one doesn't exist for the tag
+          #   3. Upload DISTORT-Setup-<version>.exe, DISTORT-Portable-<version>.exe,
+          #      and the auto-update manifests (latest.yml + latest-mac.yml +
+          #      latest-linux.yml — the latter two are no-ops for win-only
+          #      builds but electron-builder writes them anyway).
+          #
+          # The `latest.yml` file is REQUIRED by electron-updater at runtime —
+          # the desktop app reads it from the GitHub Release to discover the
+          # newest version + download URL + SHA512 checksum. Without it,
+          # autoUpdater.checkForUpdates() returns "update-not-available"
+          # forever.
           bunx electron-builder --win nsis portable --x64 --publish onTag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - uses: actions/upload-artifact@v4
         with:
           name: DISTORT-Windows-Setup
@@ -47,3 +79,14 @@ jobs:
         with:
           name: DISTORT-Windows-Portable
           path: desktop/release/DISTORT-Portable-*.exe
+      # Also upload the auto-update manifests so we can audit them in CI
+      # without needing to download the GitHub Release. electron-updater
+      # consumes `latest.yml` on Windows.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DISTORT-update-manifests
+          path: |
+            desktop/release/latest.yml
+            desktop/release/latest-mac.yml
+            desktop/release/latest-linux.yml
+          if-no-files-found: ignore
