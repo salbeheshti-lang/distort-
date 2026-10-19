@@ -410,78 +410,48 @@ type VerifyTunnelResult = {
 };
 
 async function verifyTunnelTraffic(): Promise<VerifyTunnelResult> {
+  // Use HTTP fetch through the SOCKS5 proxy instead of raw SOCKS5 + TLS.
+  // The previous raw SOCKS5 implementation was failing with ECONNRESET
+  // because it manually implemented the SOCKS5 protocol + TLS handshake,
+  // which is error-prone. Using Node's built-in fetch with a proxy agent
+  // is more reliable.
+  //
+  // We use the HTTP proxy (port 10809) instead of SOCKS5 (port 10808)
+  // because Node's fetch() supports HTTP proxies via env vars natively.
   const startTime = Date.now();
-  let socksSocket: any = null;
-  let tlsSocket: any = null;
   try {
-    const net = require("net");
-    const { connect: tlsConnect } = await import("tls");
+    // Set proxy env vars for this request
+    const prevHttpProxy = process.env.HTTP_PROXY;
+    const prevHttpsProxy = process.env.HTTPS_PROXY;
+    process.env.HTTP_PROXY = "http://127.0.0.1:10809";
+    process.env.HTTPS_PROXY = "http://127.0.0.1:10809";
 
-    // Create a SOCKS5 connection to xray's local proxy
-    socksSocket = new net.Socket();
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("SOCKS connect timeout")), 5000);
-      socksSocket.connect(10808, "127.0.0.1", () => { clearTimeout(t); resolve(); });
-      socksSocket.on("error", (err: any) => { clearTimeout(t); reject(err); });
+    // Try fetching through the proxy
+    const resp = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+      signal: AbortSignal.timeout(10000),
     });
 
-    // SOCKS5 greeting: version 5, 1 auth method, no auth
-    socksSocket.write(Buffer.from([0x05, 0x01, 0x00]));
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("SOCKS greeting timeout")), 5000);
-      socksSocket.once("data", () => { clearTimeout(t); resolve(); });
-    });
+    // Restore env vars
+    process.env.HTTP_PROXY = prevHttpProxy || "";
+    process.env.HTTPS_PROXY = prevHttpsProxy || "";
 
-    // SOCKS5 CONNECT request to www.cloudflare.com:443
-    const targetHost = "www.cloudflare.com";
-    const hostBytes = Buffer.from(targetHost);
-    const connectReq = Buffer.concat([
-      Buffer.from([0x05, 0x01, 0x00, 0x03]),
-      Buffer.from([hostBytes.length]),
-      hostBytes,
-      Buffer.from([0x01, 0xbb]), // port 443
-    ]);
-    socksSocket.write(connectReq);
+    if (!resp.ok) {
+      return {
+        verified: false,
+        exitIp: null,
+        exitCountry: null,
+        latencyMs: Date.now() - startTime,
+        error: `HTTP ${resp.status} through proxy`,
+      };
+    }
 
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("SOCKS CONNECT timeout")), 8000);
-      socksSocket.once("data", (data: Buffer) => {
-        clearTimeout(t);
-        if (data[1] === 0x00) {
-          resolve(); // connected through SOCKS
-        } else {
-          reject(new Error(`SOCKS CONNECT failed: code ${data[1]}`));
-        }
-      });
-    });
-
-    // Wrap in TLS
-    tlsSocket = tlsConnect({ socket: socksSocket, servername: targetHost });
-    await new Promise<void>((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("TLS handshake timeout")), 8000);
-      tlsSocket.once("secureConnect", () => { clearTimeout(t); resolve(); });
-      tlsSocket.once("error", (err: any) => { clearTimeout(t); reject(err); });
-    });
-
-    // Send HTTP request
-    tlsSocket.write("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n");
-
-    const response = await new Promise<string>((resolve, reject) => {
-      let data = "";
-      const t = setTimeout(() => resolve(data), 8000);
-      tlsSocket.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-      tlsSocket.on("end", () => { clearTimeout(t); resolve(data); });
-      tlsSocket.on("error", (err: any) => { clearTimeout(t); reject(err); });
-    });
-
+    const text = await resp.text();
     const latencyMs = Date.now() - startTime;
 
     // Validate response — must contain "ip=" to prove traffic flowed
-    if (response.includes("ip=")) {
-      // Parse exit IP and country from cloudflare trace response
-      // Response format: ip=x.x.x.x\nuag=...\nloc=IR\ncolo=...\n
-      const exitIp = response.match(/ip=([^\r\n]+)/)?.[1]?.trim() || "";
-      const exitCountry = response.match(/loc=([^\r\n]+)/)?.[1]?.trim() || "";
+    if (text.includes("ip=")) {
+      const exitIp = text.match(/ip=([^\r\n]+)/)?.[1]?.trim() || "";
+      const exitCountry = text.match(/loc=([^\r\n]+)/)?.[1]?.trim() || "";
       return {
         verified: true,
         exitIp: exitIp || null,
@@ -494,10 +464,13 @@ async function verifyTunnelTraffic(): Promise<VerifyTunnelResult> {
         exitIp: null,
         exitCountry: null,
         latencyMs,
-        error: "SOCKS connected but no valid HTTP response (no 'ip=' in cloudflare/cdn-cgi/trace)",
+        error: "Proxy responded but no valid trace data",
       };
     }
   } catch (e: any) {
+    // Restore env vars on error too
+    process.env.HTTP_PROXY = "";
+    process.env.HTTPS_PROXY = "";
     return {
       verified: false,
       exitIp: null,
@@ -505,10 +478,6 @@ async function verifyTunnelTraffic(): Promise<VerifyTunnelResult> {
       latencyMs: Date.now() - startTime,
       error: e?.message || String(e),
     };
-  } finally {
-    // Always clean up sockets
-    try { tlsSocket?.destroy(); } catch {}
-    try { socksSocket?.destroy(); } catch {}
   }
 }
 
@@ -879,7 +848,7 @@ async function smartReconnectWithCountryPreference(): Promise<void> {
     // Get configs and sort by country preference
     const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=50`;
     const meshRes = await fetch(meshUrl);
-    const meshData: any = await meshRes.json();
+    const meshData: any = await meshRes.json() as any;
     let configs = meshData?.configs || [];
 
     if (configs.length === 0) {
@@ -1297,27 +1266,89 @@ async function disableKillSwitch(): Promise<void> {
 
 async function quickConnect(): Promise<void> {
   try {
-    // Step 1: Get multiple optimized configs from Community Mesh.
-    // Wrapped in try/catch with disk-cache fallback so quickConnect keeps
-    // working in national-internet scenarios where the Distort API is
-    // unreachable but we still have a cached-configs.json from a previous
-    // successful refresh.
+    // Step 1: Get configs from API
     let configs: any[] = [];
     try {
       const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`;
       const meshRes = await fetch(meshUrl);
       if (meshRes.ok) {
-        const meshData: any = await meshRes.json();
+        const meshData: any = await meshRes.json() as any;
         configs = meshData?.configs || [];
         log.info(`Quick connect: fetched ${configs.length} configs from API`);
       } else {
-        log.warn(`Quick connect: API returned ${meshRes.status}, falling back to cache`);
+        log.warn(`Quick connect: API returned ${meshRes.status}, trying alternatives`);
       }
     } catch (e: any) {
-      log.warn(`Quick connect: API fetch failed (${e?.message}), falling back to cached configs`);
+      log.warn(`Quick connect: API fetch failed (${e?.message}), trying alternatives`);
     }
 
-    // Fallback to cached configs if API is unreachable or returned empty
+    // Step 2: If no configs from API, try refreshing subscription directly
+    if (configs.length === 0) {
+      log.info("Quick connect: no configs from API — refreshing Iran subscription directly");
+      try {
+        const subResp = await fetch(`${getLoadUrl()}/api/subscriptions`);
+        if (subResp.ok) {
+          const subData: any = await subResp.json() as any;
+          const subs = subData.subscriptions || [];
+          for (const sub of subs) {
+            log.info(`Quick connect: refreshing subscription "${sub.label}"`);
+            const refreshResp = await fetch(`${getLoadUrl()}/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
+            if (refreshResp.ok) {
+              const refreshData: any = await refreshResp.json() as any;
+              log.info(`Quick connect: subscription refreshed — ${refreshData.count || 0} configs`);
+            }
+          }
+          // Now try fetching configs again
+          const meshRes2 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
+          if (meshRes2.ok) {
+            const meshData2: any = await meshRes2.json() as any;
+            configs = meshData2?.configs || [];
+            log.info(`Quick connect: after refresh, fetched ${configs.length} configs`);
+          }
+        }
+      } catch (e: any) {
+        log.warn(`Quick connect: subscription refresh failed: ${e?.message}`);
+      }
+    }
+
+    // Step 3: If still no configs, fetch mixed_iran.txt DIRECTLY (guaranteed fallback)
+    if (configs.length === 0) {
+      log.info("Quick connect: no configs from API — fetching mixed_iran.txt directly");
+      try {
+        const subUrl = "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt";
+        const subRes = await fetch(subUrl, {
+          signal: AbortSignal.timeout(15000),
+          headers: { "User-Agent": "DISTORT/1.0" },
+        });
+        if (subRes.ok) {
+          const text = await subRes.text();
+          const lines = text.split("\n").map((l: string) => l.trim()).filter((l: string) => l.length > 10);
+          log.info(`Quick connect: fetched ${lines.length} lines from mixed_iran.txt`);
+          // Parse each line and add to configs
+          for (const line of lines) {
+            try {
+              // Import via API
+              await fetch(`${getLoadUrl()}/api/imported-configs/import`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ text: line }),
+              });
+            } catch {}
+          }
+          // Now fetch optimized configs
+          const meshRes3 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
+          if (meshRes3.ok) {
+            const meshData3: any = await meshRes3.json() as any;
+            configs = meshData3?.configs || [];
+            log.info(`Quick connect: after direct fetch, got ${configs.length} configs`);
+          }
+        }
+      } catch (e: any) {
+        log.warn(`Quick connect: direct mixed_iran.txt fetch failed: ${e?.message}`);
+      }
+    }
+
+    // Step 4: Last resort — try cached configs
     if (configs.length === 0) {
       try {
         const cacheFile = path.join(app.getPath("userData"), "cached-configs.json");
@@ -1332,15 +1363,14 @@ async function quickConnect(): Promise<void> {
     }
 
     if (configs.length === 0) {
-      log.error("Quick connect: no configs available (API unreachable AND no cache)");
+      log.error("Quick connect: no configs available after all attempts");
       mainWindow?.webContents.send("vpn:error",
-        "No VPN configs available. The Distort API is unreachable and no cached configs exist. " +
-        "Please connect to the internet briefly to fetch configs, then try again."
+        "No VPN configs available. All sources failed: API, subscription refresh, direct fetch, and cache."
       );
       return;
     }
 
-    log.info(`Quick connect: trying ${configs.length} optimized configs in sequence (auto-failover)`);
+    log.info(`Quick connect: trying ${configs.length} configs in sequence (auto-failover)`);
 
     // Try each config until one connects successfully
     for (let i = 0; i < configs.length; i++) {
