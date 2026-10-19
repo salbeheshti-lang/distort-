@@ -29,20 +29,23 @@ export function IpLocationWidget({ isConnected }: { isConnected: boolean }) {
   const [realIp, setRealIp] = useState<IpInfo>(initial);
   const [vpnIp, setVpnIp] = useState<IpInfo>(initial);
 
-  const fetchIpInfo = useCallback(async (target: "real" | "vpn"): Promise<IpInfo> => {
+  const fetchIpInfo = useCallback(async (): Promise<IpInfo> => {
     try {
-      // Use ipapi.co — free, no API key needed, returns JSON
-      const resp = await fetch("https://ipapi.co/json/", {
-        signal: AbortSignal.timeout(8000),
+      // Use our own API (server-side, no CORS issues)
+      const resp = await fetch("/api/ip-info", {
+        signal: AbortSignal.timeout(10000),
       });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}));
+        throw new Error(errData.error || `HTTP ${resp.status}`);
+      }
       const data = await resp.json();
       return {
         ip: data.ip || null,
-        country: data.country_name || null,
-        countryCode: data.country_code || null,
+        country: data.country || null,
+        countryCode: data.countryCode || null,
         city: data.city || null,
-        isp: data.org || null,
+        isp: data.isp || null,
         loading: false,
         error: null,
       };
@@ -57,7 +60,7 @@ export function IpLocationWidget({ isConnected }: { isConnected: boolean }) {
   // Fetch real IP on mount
   useEffect(() => {
     setRealIp((s) => ({ ...s, loading: true }));
-    fetchIpInfo("real").then(setRealIp);
+    fetchIpInfo().then(setRealIp);
   }, [fetchIpInfo]);
 
   // Fetch VPN IP when connected
@@ -66,7 +69,7 @@ export function IpLocationWidget({ isConnected }: { isConnected: boolean }) {
       setVpnIp((s) => ({ ...s, loading: true }));
       // Wait 2s for tunnel to establish
       const timer = setTimeout(() => {
-        fetchIpInfo("vpn").then(setVpnIp);
+        fetchIpInfo().then(setVpnIp);
       }, 2000);
       return () => clearTimeout(timer);
     } else {
@@ -76,12 +79,12 @@ export function IpLocationWidget({ isConnected }: { isConnected: boolean }) {
 
   const refreshReal = () => {
     setRealIp((s) => ({ ...s, loading: true, error: null }));
-    fetchIpInfo("real").then(setRealIp);
+    fetchIpInfo().then(setRealIp);
   };
 
   const refreshVpn = () => {
     setVpnIp((s) => ({ ...s, loading: true, error: null }));
-    fetchIpInfo("vpn").then(setVpnIp);
+    fetchIpInfo().then(setVpnIp);
   };
 
   return (

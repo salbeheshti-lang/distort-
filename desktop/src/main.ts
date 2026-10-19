@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.19`);
+log.info(`App version: 1.0.25`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -361,7 +361,7 @@ function buildXrayConfigFromUri(configUri: string): object {
   }
   const settings = store.get("settings");
   return buildRealXrayConfig(realCfg, {
-    tun: true, // system-wide tunnel via wintun.dll
+    tun: false, // SOCKS5 + HTTP proxy mode — no admin required
     socksPort: 10808,
     httpPort: 10809,
     dnsLeakProtection: settings.dnsLeakProtection !== false,
@@ -1564,6 +1564,17 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
 
     log.info("[companion-api] xray spawned successfully (configUri REDACTED)");
+
+    // CRITICAL: Set Electron browser proxy to route through xray's SOCKS5
+    try {
+      await session.defaultSession.setProxy({
+        proxyRules: "socks5://127.0.0.1:10808",
+      });
+      log.info("[companion-api] Browser proxy set to socks5://127.0.0.1:10808");
+    } catch (e: any) {
+      log.warn(`[companion-api] Failed to set browser proxy: ${e?.message}`);
+    }
+
     return { ok: true };
   } catch (e: any) {
     log.error(`[companion-api] Failed to spawn xray: ${e?.message}`);
@@ -1588,6 +1599,15 @@ async function stopTunnel(): Promise<{ ok: boolean }> {
     }
     vpnProcess = null;
   }
+
+  // Clear the browser proxy
+  try {
+    await session.defaultSession.setProxy({ proxyRules: "" });
+    log.info("[companion-api] Browser proxy cleared");
+  } catch (e: any) {
+    log.warn(`[companion-api] Failed to clear proxy: ${e?.message}`);
+  }
+
   // Reflect the stopped state in the desktop UI
   const vpn = store.get("vpn");
   store.set("vpn", {
