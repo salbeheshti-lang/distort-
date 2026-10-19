@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DISTORT</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #050814;
+      color: #eaf2ff;
+      overflow-x: hidden;
+    }
+    .container { max-width: 100%; padding: 16px; }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #00f0ff, #2962ff);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: bold;
+      color: #050814;
+    }
+    .logo-text {
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: 2px;
+    }
+    .logo-text span { color: #00f0ff; }
+    .version {
+      font-size: 11px;
+      color: #5cf2ff;
+      font-family: monospace;
+    }
+
+    /* Main connect button */
+    .connect-section {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 30px 0;
+    }
+    .connect-btn {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      border: 2px solid rgba(0,240,255,0.3);
+      background: #0a1020;
+      color: #00f0ff;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 2px;
+      cursor: pointer;
+      transition: all 0.3s;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .connect-btn:hover {
+      border-color: #00f0ff;
+      box-shadow: 0 0 30px rgba(0,240,255,0.2);
+    }
+    .connect-btn.connecting {
+      border-color: #ffb020;
+      color: #ffb020;
+      box-shadow: 0 0 30px rgba(255,176,32,0.2);
+    }
+    .connect-btn.connected {
+      border-color: #10d9a0;
+      background: linear-gradient(135deg, #10d9a0, #0d7a6d);
+      color: #050814;
+      box-shadow: 0 0 40px rgba(16,217,160,0.3);
+    }
+    .connect-icon {
+      font-size: 32px;
+    }
+    .connect-text {
+      text-transform: uppercase;
+      font-size: 10px;
+    }
+
+    /* Server selector */
+    .server-section {
+      margin: 16px 0;
+    }
+    .server-card {
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 10px;
+      padding: 12px;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    .server-card:hover {
+      border-color: rgba(0,240,255,0.3);
+    }
+    .server-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .server-name {
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .server-meta {
+      font-size: 11px;
+      color: #8aa0c4;
+      margin-top: 2px;
+    }
+    .server-score {
+      font-size: 11px;
+      color: #5cf2ff;
+      font-family: monospace;
+    }
+
+    /* IP section */
+    .ip-section {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin: 16px 0;
+    }
+    .ip-card {
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 10px;
+      padding: 12px;
+    }
+    .ip-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #8aa0c4;
+      margin-bottom: 6px;
+    }
+    .ip-value {
+      font-size: 16px;
+      font-family: monospace;
+      font-weight: 600;
+    }
+    .ip-location {
+      font-size: 11px;
+      color: #8aa0c4;
+      margin-top: 4px;
+    }
+    .ip-card.vpn { border-color: rgba(16,217,160,0.2); }
+    .ip-card.vpn .ip-label { color: #10d9a0; }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      padding: 8px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      overflow-x: auto;
+    }
+    .tab {
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #8aa0c4;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+    .tab:hover { color: #eaf2ff; }
+    .tab.active {
+      background: rgba(0,240,255,0.1);
+      color: #5cf2ff;
+    }
+
+    /* Config list */
+    .config-list {
+      max-height: 300px;
+      overflow-y: auto;
+    }
+    .config-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 8px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .config-item:hover {
+      border-color: rgba(0,240,255,0.2);
+    }
+    .config-item.selected {
+      border-color: #00f0ff;
+      background: rgba(0,240,255,0.05);
+    }
+    .config-protocol {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(0,240,255,0.1);
+      color: #5cf2ff;
+    }
+    .config-host {
+      font-size: 12px;
+      font-family: monospace;
+      flex: 1;
+      margin: 0 8px;
+    }
+    .config-score {
+      font-size: 10px;
+      color: #8aa0c4;
+    }
+
+    /* Input + button */
+    .input-row {
+      display: flex;
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .input {
+      flex: 1;
+      padding: 8px 12px;
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      color: #eaf2ff;
+      font-size: 12px;
+      font-family: monospace;
+    }
+    .input:focus {
+      outline: none;
+      border-color: #00f0ff;
+    }
+    .btn {
+      padding: 8px 16px;
+      border: none;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #00f0ff, #2962ff);
+      color: #050814;
+    }
+    .btn-primary:hover { opacity: 0.9; }
+    .btn-outline {
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.1);
+      color: #8aa0c4;
+    }
+    .btn-outline:hover {
+      border-color: #00f0ff;
+      color: #5cf2ff;
+    }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #0a1020;
+      border: 1px solid rgba(0,240,255,0.2);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 12px;
+      color: #eaf2ff;
+      z-index: 100;
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+    .toast.show { opacity: 1; }
+
+    /* Speed metrics */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 8px;
+      margin: 12px 0;
+    }
+    .metric {
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 8px;
+      padding: 8px;
+      text-align: center;
+    }
+    .metric-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      color: #8aa0c4;
+      margin-bottom: 4px;
+    }
+    .metric-value {
+      font-size: 14px;
+      font-family: monospace;
+      font-weight: 600;
+    }
+
+    /* Settings */
+    .setting-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px;
+      background: #0a1020;
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 8px;
+      margin-bottom: 8px;
+    }
+    .setting-label {
+      font-size: 13px;
+    }
+    .toggle {
+      width: 40px;
+      height: 22px;
+      border-radius: 11px;
+      background: rgba(255,255,255,0.1);
+      position: relative;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle.on {
+      background: #10d9a0;
+    }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: white;
+      transition: transform 0.2s;
+    }
+    .toggle.on::after {
+      transform: translateX(18px);
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">D</div>
+      <div>
+        <div class="logo-text">DIST<span>O</span>RT</div>
+        <div class="version" id="version">v2.0.0</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" data-tab="connect">Connect</div>
+    <div class="tab" data-tab="configs">Configs</div>
+    <div class="tab" data-tab="settings">Settings</div>
+    <div class="tab" data-tab="help">Help</div>
+  </div>
+
+  <!-- Content -->
+  <div class="container">
+    <!-- Connect Tab -->
+    <div id="tab-connect" class="tab-content">
+      <!-- Connect button -->
+      <div class="connect-section">
+        <button class="connect-btn" id="connectBtn" onclick="toggleConnect()">
+          <div class="connect-icon" id="connectIcon">⚡</div>
+          <div class="connect-text" id="connectText">CONNECT</div>
+        </button>
+      </div>
+
+      <!-- Selected server -->
+      <div class="server-section">
+        <div class="server-card" id="serverCard" onclick="switchTab('configs')">
+          <div class="server-info">
+            <div>
+              <div class="server-name" id="serverName">No config selected</div>
+              <div class="server-meta" id="serverMeta">Tap to select a config</div>
+            </div>
+            <div class="server-score" id="serverScore"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- IP section -->
+      <div class="ip-section">
+        <div class="ip-card">
+          <div class="ip-label">Your Real IP</div>
+          <div class="ip-value" id="realIp">—</div>
+          <div class="ip-location" id="realLocation">Loading…</div>
+        </div>
+        <div class="ip-card vpn">
+          <div class="ip-label">VPN Exit IP</div>
+          <div class="ip-value" id="vpnIp">—</div>
+          <div class="ip-location" id="vpnLocation">Not connected</div>
+        </div>
+      </div>
+
+      <!-- Speed metrics -->
+      <div class="metrics" id="metrics" style="display:none;">
+        <div class="metric">
+          <div class="metric-label">↓ Down</div>
+          <div class="metric-value" id="downSpeed">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">↑ Up</div>
+          <div class="metric-value" id="upSpeed">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Ping</div>
+          <div class="metric-value" id="ping">0</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Time</div>
+          <div class="metric-value" id="sessionTime">0:00</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Configs Tab -->
+    <div id="tab-configs" class="tab-content" style="display:none;">
+      <div class="input-row">
+        <input class="input" id="subUrl" placeholder="Subscription URL (https://...)" />
+        <button class="btn btn-primary" onclick="fetchSub()">Fetch</button>
+      </div>
+      <div class="input-row">
+        <input class="input" id="configUri" placeholder="vless://... or vmess://... or trojan://... or ss://..." />
+        <button class="btn btn-outline" onclick="addConfig()">Add</button>
+      </div>
+      <div class="config-list" id="configList"></div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div id="tab-settings" class="tab-content" style="display:none;">
+      <div class="setting-row">
+        <span class="setting-label">Auto-connect on startup</span>
+        <div class="toggle" id="autoConnect" onclick="toggleSetting('autoConnect')"></div>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">Stealth mode</span>
+        <div class="toggle on" id="stealthMode" onclick="toggleSetting('stealthMode')"></div>
+      </div>
+      <div class="setting-row">
+        <span class="setting-label">DNS leak protection</span>
+        <div class="toggle on" id="dnsLeakProtection" onclick="toggleSetting('dnsLeakProtection')"></div>
+      </div>
+    </div>
+
+    <!-- Help Tab -->
+    <div id="tab-help" class="tab-content" style="display:none;">
+      <div class="server-card" style="margin-bottom: 12px;">
+        <div style="font-size: 14px; font-weight: 700; margin-bottom: 8px;">DISTORT</div>
+        <div class="version" id="helpVersion">v2.0.0 · 100% Free · MIT</div>
+        <div style="font-size: 12px; color: #8aa0c4; margin-top: 8px;">Freedom Beyond Borders</div>
+      </div>
+      <div class="server-card" style="margin-bottom: 12px;">
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">Quick Links</div>
+        <a href="https://github.com/di6tort-bit/distort" style="display:block; font-size:12px; color:#5cf2ff; margin-bottom:4px;">→ GitHub Repository</a>
+        <a href="https://github.com/di6tort-bit/distort/releases" style="display:block; font-size:12px; color:#5cf2ff;">→ Download Latest Release</a>
+      </div>
+      <div class="server-card">
+        <div style="font-size: 13px; font-weight: 600; margin-bottom: 8px;">Logs</div>
+        <div style="font-size: 11px; color: #8aa0c4; font-family: monospace;" id="logPath">%APPDATA%\DISTORT\logs\main.log</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // State
+    let isConnected = false;
+    let isConnecting = false;
+    let selectedConfig = null;
+    let configs = [];
+    let settings = { autoConnect: false, stealthMode: true, dnsLeakProtection: true };
+
+    // Init
+    async function init() {
+      // Version
+      const ver = await window.distort.version();
+      document.getElementById('version').textContent = 'v' + ver;
+      document.getElementById('helpVersion').textContent = 'v' + ver + ' · 100% Free · MIT';
+
+      // Configs
+      configs = await window.distort.configs.get();
+      renderConfigs();
+
+      // Auto-select first config
+      if (configs.length > 0) {
+        selectedConfig = configs[0];
+        updateServerCard();
+      }
+
+      // Settings
+      settings = await window.distort.settings.get();
+      updateSettingsUI();
+
+      // IP info
+      fetchIpInfo();
+
+      // Listen for events
+      window.distort.onConnected(() => {
+        isConnected = true;
+        isConnecting = false;
+        updateConnectBtn();
+        document.getElementById('metrics').style.display = 'grid';
+        fetchVpnIp();
+      });
+      window.distort.onDisconnected(() => {
+        isConnected = false;
+        isConnecting = false;
+        updateConnectBtn();
+        document.getElementById('metrics').style.display = 'none';
+        document.getElementById('vpnIp').textContent = '—';
+        document.getElementById('vpnLocation').textContent = 'Not connected';
+      });
+      window.distort.onConfigsUpdated(() => {
+        configs = await window.distort.configs.get();
+        renderConfigs();
+      });
+
+      // Auto-connect
+      if (settings.autoConnect && selectedConfig) {
+        toggleConnect();
+      }
+    }
+
+    // Tabs
+    function switchTab(name) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`[data-tab="${name}"]`).classList.add('active');
+      document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+      document.getElementById('tab-' + name).style.display = 'block';
+    }
+    document.querySelectorAll('.tab').forEach(t => {
+      t.addEventListener('click', () => switchTab(t.dataset.tab));
+    });
+
+    // Connect
+    async function toggleConnect() {
+      if (isConnected) {
+        await window.distort.disconnect();
+        return;
+      }
+      if (!selectedConfig) {
+        showToast('Select a config first');
+        switchTab('configs');
+        return;
+      }
+      isConnecting = true;
+      updateConnectBtn();
+      const r = await window.distort.connect(selectedConfig.uri);
+      if (!r.ok) {
+        showToast('Connection failed: ' + (r.error || 'unknown'));
+        isConnecting = false;
+        updateConnectBtn();
+      }
+    }
+
+    function updateConnectBtn() {
+      const btn = document.getElementById('connectBtn');
+      const icon = document.getElementById('connectIcon');
+      const text = document.getElementById('connectText');
+      btn.className = 'connect-btn';
+      if (isConnected) {
+        btn.classList.add('connected');
+        icon.textContent = '✓';
+        text.textContent = 'CONNECTED';
+      } else if (isConnecting) {
+        btn.classList.add('connecting');
+        icon.textContent = '⏳';
+        text.textContent = 'CONNECTING…';
+      } else {
+        icon.textContent = '⚡';
+        text.textContent = 'CONNECT';
+      }
+    }
+
+    // Configs
+    function renderConfigs() {
+      const list = document.getElementById('configList');
+      if (configs.length === 0) {
+        list.innerHTML = '<div style="text-align:center; padding:20px; color:#8aa0c4; font-size:12px;">No configs. Fetch a subscription or paste a URI above.</div>';
+        return;
+      }
+      list.innerHTML = configs.map((c, i) => `
+        <div class="config-item ${selectedConfig && selectedConfig.uri === c.uri ? 'selected' : ''}" onclick="selectConfig(${i})">
+          <span class="config-protocol">${c.protocol}</span>
+          <span class="config-host">${c.host}:${c.port}</span>
+          <span class="config-score">${c.score}</span>
+        </div>
+      `).join('');
+    }
+
+    function selectConfig(idx) {
+      selectedConfig = configs[idx];
+      updateServerCard();
+      renderConfigs();
+      switchTab('connect');
+    }
+
+    function updateServerCard() {
+      if (selectedConfig) {
+        document.getElementById('serverName').textContent = selectedConfig.protocol.toUpperCase() + ' · ' + selectedConfig.host + ':' + selectedConfig.port;
+        document.getElementById('serverMeta').textContent = selectedConfig.flags || 'No flags';
+        document.getElementById('serverScore').textContent = 'Score: ' + selectedConfig.score;
+      }
+    }
+
+    async function fetchSub() {
+      const url = document.getElementById('subUrl').value.trim();
+      if (!url) { showToast('Enter a URL'); return; }
+      showToast('Fetching…');
+      const r = await window.distort.fetchSubscription(url);
+      if (r.ok) {
+        configs = await window.distort.configs.get();
+        renderConfigs();
+        showToast('Fetched ' + r.count + ' configs');
+        if (!selectedConfig && configs.length > 0) {
+          selectedConfig = configs[0];
+          updateServerCard();
+        }
+      } else {
+        showToast('Failed: ' + r.error);
+      }
+    }
+
+    async function addConfig() {
+      const uri = document.getElementById('configUri').value.trim();
+      if (!uri) { showToast('Enter a URI'); return; }
+      const r = await window.distort.configs.add(uri);
+      if (r.ok) {
+        configs = await window.distort.configs.get();
+        renderConfigs();
+        document.getElementById('configUri').value = '';
+        showToast('Config added');
+      } else {
+        showToast('Failed: ' + r.error);
+      }
+    }
+
+    // IP info
+    async function fetchIpInfo() {
+      try {
+        const r = await window.distort.getIpInfo();
+        if (r.ok) {
+          document.getElementById('realIp').textContent = r.ip;
+          document.getElementById('realLocation').textContent = (r.city ? r.city + ', ' : '') + (r.country || 'Unknown');
+        } else {
+          document.getElementById('realIp').textContent = 'Error';
+          document.getElementById('realLocation').textContent = r.error || 'Could not fetch';
+        }
+      } catch (e) {
+        document.getElementById('realIp').textContent = 'Error';
+        document.getElementById('realLocation').textContent = e.message;
+      }
+    }
+
+    async function fetchVpnIp() {
+      // Wait 2s for tunnel
+      setTimeout(async () => {
+        try {
+          const r = await window.distort.getIpInfo();
+          if (r.ok) {
+            document.getElementById('vpnIp').textContent = r.ip;
+            document.getElementById('vpnLocation').textContent = (r.city ? r.city + ', ' : '') + (r.country || 'Unknown');
+          }
+        } catch {}
+      }, 2000);
+    }
+
+    // Settings
+    function updateSettingsUI() {
+      document.getElementById('autoConnect').classList.toggle('on', settings.autoConnect);
+      document.getElementById('stealthMode').classList.toggle('on', settings.stealthMode);
+      document.getElementById('dnsLeakProtection').classList.toggle('on', settings.dnsLeakProtection);
+    }
+
+    async function toggleSetting(name) {
+      settings[name] = !settings[name];
+      updateSettingsUI();
+      await window.distort.settings.save(settings);
+      showToast('Settings saved');
+    }
+
+    // Toast
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 3000);
+    }
+
+    // Start
+    init();
+  </script>
+</body>
+</html>

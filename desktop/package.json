@@ -1,7 +1,7 @@
 {
   "name": "distort-desktop",
-  "version": "1.0.23",
-  "description": "DISTORT — Freedom Beyond Borders. A 100% free, anti-censorship VPN stronger than Nekoray & Hiddify.",
+  "version": "2.0.0",
+  "description": "DISTORT \u2014 Freedom Beyond Borders. A 100% free, anti-censorship VPN stronger than Nekoray & Hiddify.",
   "main": "dist/main.js",
   "author": "DISTORT Project",
   "license": "MIT",
@@ -18,7 +18,7 @@
   "build": {
     "appId": "com.distort.desktop",
     "productName": "DISTORT",
-    "copyright": "Copyright © 2026 DISTORT Project",
+    "copyright": "Copyright \u00a9 2026 DISTORT Project",
     "directories": {
       "output": "release",
       "buildResources": "build"
@@ -31,34 +31,13 @@
     "files": [
       "dist/**/*",
       "resources/**/*",
-      "package.json",
-      "node_modules/sql.js/**/*"
+      "ui/**/*",
+      "package.json"
     ],
     "extraResources": [
       {
         "from": "resources/bin",
         "to": "bin",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../.next/standalone",
-        "to": "next-standalone",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../.next/static",
-        "to": "next-standalone/.next/static",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../public",
-        "to": "next-standalone/public",
         "filter": [
           "**/*"
         ]
@@ -118,11 +97,7 @@
     }
   },
   "dependencies": {
-    "electron-log": "^5.2.0",
-    "electron-store": "^8.2.0",
-    "electron-updater": "^6.8.9",
-    "node-fetch": "^3.3.2",
-    "sql.js": "^1.15.0"
+    "electron-log": "^5.2.0"
   },
   "devDependencies": {
     "electron": "^33.0.0",

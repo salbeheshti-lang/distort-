@@ -1,75 +1,37 @@
-"use strict";
-// DISTORT Desktop — preload script
-// Exposes a safe, minimal API to the renderer (sandboxed).
-Object.defineProperty(exports, "__esModule", { value: true });
-const electron_1 = require("electron");
-electron_1.contextBridge.exposeInMainWorld("distort", {
+// DISTORT — preload (simplified)
+const { contextBridge, ipcRenderer } = require("electron");
+contextBridge.exposeInMainWorld("distort", {
     // VPN
-    vpn: {
-        connect: (server, protocol, configUri) => electron_1.ipcRenderer.invoke("vpn:connect", server, protocol, configUri),
-        disconnect: () => electron_1.ipcRenderer.invoke("vpn:disconnect"),
-        getState: () => electron_1.ipcRenderer.invoke("vpn:state"),
-        onStateChange: (cb) => {
-            const handler = (_e, state) => cb(state);
-            electron_1.ipcRenderer.on("vpn:state-changed", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:state-changed", handler);
-        },
-        onConnecting: (cb) => {
-            const handler = (_e, info) => cb(info);
-            electron_1.ipcRenderer.on("vpn:connecting", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:connecting", handler);
-        },
-        onReconnecting: (cb) => {
-            const handler = (_e, info) => cb(info);
-            electron_1.ipcRenderer.on("vpn:reconnecting", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:reconnecting", handler);
-        },
-        onCountryChange: (cb) => {
-            const handler = (_e, info) => cb(info);
-            electron_1.ipcRenderer.on("vpn:country-change", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:country-change", handler);
-        },
-        onExitInfo: (cb) => {
-            const handler = (_e, info) => cb(info);
-            electron_1.ipcRenderer.on("vpn:exit-info", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:exit-info", handler);
-        },
-        onError: (cb) => {
-            const handler = (_e, err) => cb(err);
-            electron_1.ipcRenderer.on("vpn:error", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:error", handler);
-        },
-        onKillSwitch: (cb) => {
-            const handler = () => cb();
-            electron_1.ipcRenderer.on("vpn:kill-switch-activated", handler);
-            return () => electron_1.ipcRenderer.removeListener("vpn:kill-switch-activated", handler);
-        },
+    connect: (uri) => ipcRenderer.invoke("vpn:connect", uri),
+    disconnect: () => ipcRenderer.invoke("vpn:disconnect"),
+    // Configs
+    configs: {
+        get: () => ipcRenderer.invoke("configs:get"),
+        add: (uri) => ipcRenderer.invoke("configs:add", uri),
+        delete: (uri) => ipcRenderer.invoke("configs:delete", uri),
     },
+    // Subscription
+    fetchSubscription: (url) => ipcRenderer.invoke("subscription:fetch", url),
+    // IP info
+    getIpInfo: () => ipcRenderer.invoke("ip:info"),
     // Settings
     settings: {
-        get: () => electron_1.ipcRenderer.invoke("settings:get"),
-        set: (patch) => electron_1.ipcRenderer.invoke("settings:set", patch),
+        get: () => ipcRenderer.invoke("settings:get"),
+        save: (s) => ipcRenderer.invoke("settings:save", s),
     },
-    // App info
-    app: {
-        version: () => electron_1.ipcRenderer.invoke("app:version"),
-        platform: () => electron_1.ipcRenderer.invoke("app:platform"),
+    // App
+    version: () => ipcRenderer.invoke("app:version"),
+    // Events
+    onConnected: (cb) => {
+        ipcRenderer.on("vpn:connected", cb);
+        return () => ipcRenderer.removeListener("vpn:connected", cb);
     },
-    // Navigation (from tray)
-    onNavigate: (cb) => {
-        const handler = (_e, view) => cb(view);
-        electron_1.ipcRenderer.on("navigate", handler);
-        return () => electron_1.ipcRenderer.removeListener("navigate", handler);
+    onDisconnected: (cb) => {
+        ipcRenderer.on("vpn:disconnected", cb);
+        return () => ipcRenderer.removeListener("vpn:disconnected", cb);
     },
-    // Capabilities — what the desktop shell can actually do
-    capabilities: {
-        desktopShell: true,
-        vpnEngine: true, // ✅ xray-core is bundled and integrated
-        autoUpdate: true,
-        systemTray: true,
-        minimizeToTray: true,
-        communityServersConfigured: true,
-        socksProxy: { host: "127.0.0.1", port: 10808 },
-        httpProxy: { host: "127.0.0.1", port: 10809 },
+    onConfigsUpdated: (cb) => {
+        ipcRenderer.on("configs:updated", cb);
+        return () => ipcRenderer.removeListener("configs:updated", cb);
     },
 });
