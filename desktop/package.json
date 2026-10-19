@@ -1,6 +1,6 @@
 {
   "name": "distort-desktop",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "DISTORT \u2014 Freedom Beyond Borders. A 100% free, anti-censorship VPN stronger than Nekoray & Hiddify.",
   "main": "dist/main.js",
   "author": "DISTORT Project",

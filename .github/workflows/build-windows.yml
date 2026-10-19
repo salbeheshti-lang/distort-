@@ -18,10 +18,6 @@ jobs:
         working-directory: desktop
         run: bun install
 
-      - name: Generate icons
-        working-directory: desktop
-        run: bun run build-icons.mjs
-
       - name: Download xray-core (Windows)
         working-directory: desktop
         shell: bash
