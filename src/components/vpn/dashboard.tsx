@@ -159,7 +159,7 @@ function HelpView() {
           <div>
             <h3 className="text-xl font-bold text-white">DISTORT</h3>
             <p className="text-sm text-muted-foreground">Freedom Beyond Borders</p>
-            <p className="text-xs text-[#5cf2ff] font-tech mt-1">v1.0.25 · 100% Free · MIT</p>
+            <p className="text-xs text-[#5cf2ff] font-tech mt-1">v1.0.26 · 100% Free · MIT</p>
           </div>
         </div>
       </div>
