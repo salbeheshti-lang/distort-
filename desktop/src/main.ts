@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.27`);
+log.info(`App version: 1.0.28`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -1987,17 +1987,14 @@ function startCompanionApiServer(): void {
 
   server.on("error", (err: any) => {
     if (err?.code === "EADDRINUSE") {
-      log.error(
-        `[companion-api] Port ${COMPANION_API_PORT} is already in use — ` +
-        `another Distort Desktop instance may be running. The companion control API will NOT be available.`
-      );
+      log.error(`[companion-api] Port ${COMPANION_API_PORT} is already in use — another DISTORT instance may be running. The companion control API will NOT be available.`);
     } else {
       log.error(`[companion-api] Server error: ${err?.message}`);
     }
   });
 
   server.listen(COMPANION_API_PORT, COMPANION_API_HOST, () => {
-    log.info(`Companion control API listening on http://${COMPANION_API_HOST}:${COMPANION_API_PORT}`);
+    log.info(`[companion-api] ✅ Companion control API listening on http://${COMPANION_API_HOST}:${COMPANION_API_PORT}`);
   });
 
   companionApiServer = server;

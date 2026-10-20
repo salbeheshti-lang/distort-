@@ -119,26 +119,14 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
             throw new Error(result.error || "Tunnel failed to start");
           }
         } else {
-          // Companion API not available — fall back to demo mode
-          connect({
-            id: selectedConfig.id,
-            code: selectedConfig.host,
-            country: selectedConfig.country || "Iran",
-            city: selectedConfig.host,
-            flag: "🇮🇷",
-            host: selectedConfig.host,
-            port: selectedConfig.port,
-            protocols: selectedConfig.protocol,
-            load: 0,
-            ping: selectedConfig.latencyMs || 50,
-            upMbps: 1000,
-            downMbps: 1000,
-            online: true,
-            premium: false,
-            stealth: true,
-            note: selectedConfig.flags,
-          } as ServerLite, selectedConfig.protocol);
-          toast.info("Demo mode", { description: "Install the desktop app for real VPN tunneling. Using simulated connection." });
+          // Companion API not available — DON'T fall back to demo mode.
+          // Show the real error so the user knows what's wrong.
+          let errorMsg = "Companion API not reachable";
+          try {
+            const errData = await companionResp.json();
+            errorMsg = errData.error || errorMsg;
+          } catch {}
+          throw new Error(`Connection failed: ${errorMsg}. Check Help tab → Run Diagnostic.`);
         }
 
         // Create session record
