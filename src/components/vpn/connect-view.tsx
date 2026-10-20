@@ -404,7 +404,7 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span>
             Desktop companion not detected. Real VPN tunneling requires the desktop app.
-            The connection will work in demo mode (simulated speeds).
+            Connection will fail until the companion API is running.
           </span>
         </div>
       )}
