@@ -96,37 +96,64 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
         if (companionResp.ok) {
           const result = await companionResp.json();
           if (result.ok) {
-            connect({
-              id: selectedConfig.id,
-              code: selectedConfig.host,
-              country: selectedConfig.country || "Iran",
-              city: selectedConfig.host,
-              flag: "🇮🇷",
-              host: selectedConfig.host,
-              port: selectedConfig.port,
-              protocols: selectedConfig.protocol,
-              load: 0,
-              ping: selectedConfig.latencyMs || 50,
-              upMbps: 1000,
-              downMbps: 1000,
-              online: true,
-              premium: false,
-              stealth: true,
-              note: selectedConfig.flags,
-            } as ServerLite, selectedConfig.protocol);
-            toast.success("Connecting…", { description: `${selectedConfig.protocol} → ${selectedConfig.host}:${selectedConfig.port}` });
+            // xray started — but we need to VERIFY it actually works
+            // Wait 3s for xray to fully initialize, then check tunnel status
+            toast.info("Starting tunnel…", { description: `${selectedConfig.protocol} → ${selectedConfig.host}:${selectedConfig.port}` });
+            await new Promise((r) => setTimeout(r, 3000));
+
+            // Check if xray is still running
+            const statusResp = await fetch("/api/tunnel/status");
+            if (statusResp.ok) {
+              const statusData = await statusResp.json();
+              if (statusData.running) {
+                // xray is running — now verify traffic actually flows
+                const verifyResp = await fetch("/api/tunnel/verify", { method: "POST" });
+                if (verifyResp.ok) {
+                  const verifyData = await verifyResp.json();
+                  if (verifyData.trafficVerified) {
+                    // REAL verified connection!
+                    connect({
+                      id: selectedConfig.id,
+                      code: selectedConfig.host,
+                      country: selectedConfig.country || "Iran",
+                      city: selectedConfig.host,
+                      flag: "🇮🇷",
+                      host: selectedConfig.host,
+                      port: selectedConfig.port,
+                      protocols: selectedConfig.protocol,
+                      load: 0,
+                      ping: verifyData.latencyMs || 50,
+                      upMbps: 1000,
+                      downMbps: 1000,
+                      online: true,
+                      premium: false,
+                      stealth: true,
+                      note: selectedConfig.flags,
+                    } as ServerLite, selectedConfig.protocol);
+                    toast.success("Connected!", { description: `Exit IP: ${verifyData.exitIp}` });
+                  } else {
+                    throw new Error(`Tunnel started but traffic verification failed: ${verifyData.error || "unknown"}`);
+                  }
+                } else {
+                  throw new Error("Tunnel started but verification endpoint failed");
+                }
+              } else {
+                throw new Error("xray crashed after starting — check logs");
+              }
+            } else {
+              throw new Error("Cannot check tunnel status");
+            }
           } else {
             throw new Error(result.error || "Tunnel failed to start");
           }
         } else {
-          // Companion API not available — DON'T fall back to demo mode.
-          // Show the real error so the user knows what's wrong.
+          // Companion API not available
           let errorMsg = "Companion API not reachable";
           try {
             const errData = await companionResp.json();
             errorMsg = errData.error || errorMsg;
           } catch {}
-          throw new Error(`Connection failed: ${errorMsg}. Check Help tab → Run Diagnostic.`);
+          throw new Error(`Connection failed: ${errorMsg}`);
         }
 
         // Create session record
