@@ -1377,6 +1377,30 @@ async function quickConnect(): Promise<void> {
       const cfg = configs[i];
       log.info(`Quick connect: attempt ${i + 1}/${configs.length} — ${cfg.protocol} ${cfg.host}:${cfg.port} (${cfg.flags || 'no flags'})`);
 
+      // TCP probe — don't waste time on unreachable servers
+      try {
+        const net = require("net");
+        const probeResult = await new Promise<{ ok: boolean; latency: number }>((resolve) => {
+          const socket = new net.Socket();
+          const start = Date.now();
+          const t = setTimeout(() => { socket.destroy(); resolve({ ok: false, latency: 0 }); }, 3000);
+          socket.connect(cfg.port, cfg.host, () => {
+            clearTimeout(t);
+            socket.destroy();
+            resolve({ ok: true, latency: Date.now() - start });
+          });
+          socket.on("error", () => { clearTimeout(t); resolve({ ok: false, latency: 0 }); });
+        });
+        if (!probeResult.ok) {
+          log.warn(`Quick connect: ${cfg.host}:${cfg.port} unreachable (TCP probe failed) — skipping`);
+          continue;
+        }
+        log.info(`Quick connect: ${cfg.host}:${cfg.port} reachable (${probeResult.latency}ms)`);
+      } catch (e: any) {
+        log.warn(`Quick connect: TCP probe error: ${e?.message} — skipping`);
+        continue;
+      }
+
       // Notify UI of attempt
       mainWindow?.webContents.send("vpn:connecting", {
         attempt: i + 1,
@@ -2409,6 +2433,15 @@ function startNextServer(): Promise<void> {
       }, 500);
     };
 
+    // Check if DB exists and is valid (not zero-byte)
+    if (fs.existsSync(dbPath)) {
+      const stat = fs.statSync(dbPath);
+      if (stat.size === 0) {
+        log.warn(`Database file exists but is 0 bytes — deleting and recreating`);
+        try { fs.unlinkSync(dbPath); } catch {}
+      }
+    }
+
     if (!fs.existsSync(dbPath)) {
       log.info("First run — initializing database schema + seed data…");
       initDatabase(dbPath)
@@ -2456,7 +2489,7 @@ async function autoFetchSubscription(): Promise<void> {
     const countRes = await fetch("http://127.0.0.1:38571/api/imported-configs?limit=1");
     if (countRes.ok) {
       const countData = await countRes.json() as { configs: unknown[] };
-      if (countData.configs && countData.configs.length > 0) {
+      if (false && countData.configs && countData.configs.length > 0) {
         log.info("Auto-fetch: configs already exist — skipping subscription fetch");
         return;
       }
