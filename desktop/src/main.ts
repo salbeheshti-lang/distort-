@@ -51,7 +51,7 @@ log.info(`Electron: ${process.versions.electron}`);
 log.info(`Node: ${process.versions.node}`);
 log.info(`Platform: ${process.platform} ${process.arch}`);
 log.info(`Process execPath: ${process.execPath}`);
-log.info(`App version: 1.0.26`);
+log.info(`App version: 1.0.27`);
 log.info(`Data dir: ${DISTORT_DATA_DIR}`);
 log.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
 log.info("============================================================");
@@ -2439,8 +2439,21 @@ function startNextServer(): Promise<void> {
 // the DB (i.e., first run or after a reset).
 async function autoFetchSubscription(): Promise<void> {
   try {
-    // Wait a bit for the server to be fully ready
-    await new Promise((r) => setTimeout(r, 5000));
+    // Wait for server to be fully ready
+    log.info("Auto-fetch: waiting for server to be ready…");
+    let serverReady = false;
+    for (let i = 0; i < 20; i++) {
+      try {
+        const r = await fetch("http://127.0.0.1:38571/api/servers");
+        if (r.ok) { serverReady = true; break; }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!serverReady) {
+      log.warn("Auto-fetch: server not ready after 20s — aborting");
+      return;
+    }
+    log.info("Auto-fetch: server is ready");
 
     // Check if we already have configs — if so, skip
     const countRes = await fetch("http://127.0.0.1:38571/api/imported-configs?limit=1");
@@ -2466,21 +2479,34 @@ async function autoFetchSubscription(): Promise<void> {
       return;
     }
 
-    // Refresh each subscription (usually just one — the Iran config collector)
+    // Refresh each subscription
     for (const sub of subs) {
-      log.info(`Auto-fetch: refreshing "${sub.label}" (${sub.url})`);
-      const refreshRes = await fetch(`http://127.0.0.1:38571/api/subscriptions/${sub.id}/refresh`, {
-        method: "POST",
-      });
-      if (refreshRes.ok) {
-        const refreshData = await refreshRes.json() as { count?: number };
-        log.info(`Auto-fetch: "${sub.label}" refreshed — ${refreshData.count || 0} configs`);
-      } else {
-        log.warn(`Auto-fetch: refresh failed for "${sub.label}" (${refreshRes.status})`);
+      log.info(`Auto-fetch: refreshing "${sub.label}"`);
+      try {
+        const refreshRes = await fetch(`http://127.0.0.1:38571/api/subscriptions/${sub.id}/refresh`, {
+          method: "POST",
+        });
+        if (refreshRes.ok) {
+          const refreshData = await refreshRes.json() as { count?: number };
+          log.info(`Auto-fetch: "${sub.label}" refreshed — ${refreshData.count || 0} configs`);
+        } else {
+          log.warn(`Auto-fetch: refresh failed for "${sub.label}" (${refreshRes.status})`);
+        }
+      } catch (e: any) {
+        log.warn(`Auto-fetch: refresh error for "${sub.label}": ${e?.message}`);
       }
     }
 
-    log.info("Auto-fetch: subscription fetch complete — Quick Connect is ready");
+    // Verify configs are now available
+    const verifyRes = await fetch("http://127.0.0.1:38571/api/imported-configs?bucket=optimized&limit=1");
+    if (verifyRes.ok) {
+      const verifyData = await verifyRes.json() as { configs: unknown[] };
+      log.info(`Auto-fetch: complete — ${verifyData.configs?.length || 0} optimized configs now available`);
+    }
+
+    // Now trigger quick connect
+    log.info("Auto-fetch: triggering quick connect…");
+    quickConnect().catch((e) => log.warn(`Auto-fetch: quickConnect failed: ${e?.message}`));
   } catch (e: any) {
     log.warn(`Auto-fetch: failed (non-fatal): ${e?.message}`);
   }
@@ -2571,10 +2597,11 @@ app.whenReady().then(async () => {
     log.warn(`[auto-updater] setupAutoUpdater threw (non-fatal): ${e?.message}`);
   }
 
-  // Auto-connect on startup if enabled
-  if (store.get("settings.autoConnect")) {
-    setTimeout(() => quickConnect(), 1500);
-  }
+  // Auto-connect: handled by autoFetchSubscription() which calls quickConnect()
+  // after configs are fetched. Don't call quickConnect separately — it would
+  // run before configs are available.
+  // The old setTimeout(() => quickConnect(), 1500) was too early — configs
+  // weren't fetched yet.
 
   // AUTO-REFRESH SUBSCRIPTIONS — keeps configs fresh for national internet resilience.
   // Every 60 minutes, refresh all enabled subscriptions so we always have the latest
