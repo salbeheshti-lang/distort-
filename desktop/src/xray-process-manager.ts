@@ -62,6 +62,19 @@ export type StopXrayOptions = {
   httpPort?: number;
   /** Optional logger (defaults to console). */
   log?: (level: "info" | "warn" | "error", msg: string) => void;
+  /**
+   * Injectable port prober (v8 audit). When provided, replaces the default
+   * TCP-based `waitForPortReleased` function. This is a TEST SEAM — it lets
+   * deterministic tests control the port-probe result without relying on
+   * real TCP timing.
+   *
+   * The function receives (port, attempts, intervalMs) and must return
+   * a Promise<boolean>: true if the port is free, false if still in use.
+   *
+   * Production code does NOT pass this option — it uses the default
+   * `waitForPortReleased` which does a real TCP connect probe.
+   */
+  portProber?: (port: number, attempts: number, intervalMs: number) => Promise<boolean>;
 };
 
 // ---------------------------------------------------------------------------
@@ -138,6 +151,11 @@ export async function stopXrayProcess(
   const socksPort = opts?.socksPort ?? DEFAULT_SOCKS_PORT;
   const httpPort = opts?.httpPort ?? DEFAULT_HTTP_PORT;
   const log = opts?.log ?? ((level, msg) => console[level](msg));
+  // TEST SEAM (v8 audit): use the injectable portProber if provided,
+  // otherwise fall back to the real TCP-based waitForPortReleased.
+  const doPortProbe = opts?.portProber ?? ((port: number, attempts: number, intervalMs: number) =>
+    waitForPortReleased(port, attempts, intervalMs, (m) => log("warn", m))
+  );
 
   let didExit = false;
   let stuck = false;
@@ -228,8 +246,8 @@ export async function stopXrayProcess(
       // Re-probe BOTH ports. If either is still in use, do NOT clear the
       // stuck flag — the next spawn would hit EADDRINUSE. Log a CRITICAL
       // error so the user knows they need to restart the app.
-      waitForPortReleased(socksPort, portProbeAttempts, portProbeIntervalMs)
-        .then((socksFree) => waitForPortReleased(httpPort, portProbeAttempts, portProbeIntervalMs)
+      doPortProbe(socksPort, portProbeAttempts, portProbeIntervalMs)
+        .then((socksFree) => doPortProbe(httpPort, portProbeAttempts, portProbeIntervalMs)
           .then((httpFree) => {
             if (socksFree && httpFree) {
               log("info", `stopXrayProcess: stuck process exited + ports ${socksPort}/${httpPort} now free — clearing stuck state`);
@@ -253,8 +271,8 @@ export async function stopXrayProcess(
     proc.once("exit", onStuckExit);
   } else {
     // Phase 4: Port-release probe (only if the process actually exited).
-    const socksFree = await waitForPortReleased(socksPort, portProbeAttempts, portProbeIntervalMs, (m) => log("warn", m));
-    const httpFree = await waitForPortReleased(httpPort, portProbeAttempts, portProbeIntervalMs, (m) => log("warn", m));
+    const socksFree = await doPortProbe(socksPort, portProbeAttempts, portProbeIntervalMs);
+    const httpFree = await doPortProbe(httpPort, portProbeAttempts, portProbeIntervalMs);
     portsReleased = socksFree && httpFree;
     if (!portsReleased) {
       log("error",
