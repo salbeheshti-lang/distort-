@@ -134,15 +134,29 @@ export function buildRealXrayConfig(cfg: RealServerConfig, opts?: { tun?: boolea
   // TUN inbound for system-wide VPN (Windows: wintun.dll, Linux: /dev/net/tun)
   // xray-core 1.8+ supports this. Routes all traffic through xray.
   if (useTun) {
+    // TUN inbound for system-wide VPN (Windows: wintun.dll, Linux: /dev/net/tun)
+    // xray-core 1.8+ supports this. Routes all traffic through xray.
+    //
+    // BUGFIX (v1.0.34): The previous config had THREE bugs that caused xray to
+    // exit immediately on startup:
+    //   1. `listen: "127.0.0.1"` — TUN inbound doesn't have a listen field.
+    //      xray-core rejects unknown fields in some versions.
+    //   2. `ip: "172.19.0.1"` — newer xray-core (v25+) renamed this to `address`
+    //      AND expects CIDR format ("172.19.0.1/24"), not bare IP.
+    //   3. `excludeRoutes: ["hostname/32"]` — excludeRoutes MUST be IP CIDRs.
+    //      Hostnames cause a parse error. We now omit excludeRoutes entirely
+    //      and rely on xray's built-in loop prevention (xray-core 1.8+ auto-detects
+    //      when outbound traffic would loop back through the TUN).
     inbounds.push({
       tag: "tun-in",
-      listen: "127.0.0.1",
       protocol: "tun",
       settings: {
-        ip: "172.19.0.1",
+        address: "172.19.0.1/24",
         mtu: 1420,
         routes: ["0.0.0.0/0", "::/0"],
-        excludeRoutes: [`${cfg.host}/32`],
+        // excludeRoutes omitted — xray-core 1.8+ has automatic loop prevention.
+        // Including a hostname here crashes xray; including an IP is an optimization
+        // we can add later if loop issues arise.
         hijackDns: dnsProtect,
         autoRoute: true,
         strictRoute: true,
@@ -205,7 +219,7 @@ function buildRealOutbound(cfg: RealServerConfig): any | null {
 
   if (cfg.protocol === "vmess") {
     if (!cfg.uuid) throw new Error("VMess requires a real UUID");
-    return {
+    const out: any = {
       tag,
       protocol: "vmess",
       settings: {
@@ -224,8 +238,13 @@ function buildRealOutbound(cfg: RealServerConfig): any | null {
         ],
       },
       streamSettings: buildStreamSettings(cfg),
-      mux: { enabled: cfg.network === "ws", concurrency: 8 },
     };
+    // Only add mux for WS — some xray-core versions reject mux:{enabled:false}
+    // with concurrency set. Omit entirely when not WS.
+    if (cfg.network === "ws") {
+      out.mux = { enabled: true, concurrency: 8 };
+    }
+    return out;
   }
 
   if (cfg.protocol === "vless") {

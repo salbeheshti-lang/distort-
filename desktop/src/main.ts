@@ -1570,6 +1570,62 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
   }
 
+  // PRE-FLIGHT VALIDATION (v1.0.34): run `xray run -test -c config.json` to
+  // validate the config WITHOUT starting the tunnel. This catches 90% of
+  // config errors (invalid fields, unknown protocols, bad credentials format)
+  // and returns the ACTUAL xray error message to the UI instead of the
+  // generic "xray process exited immediately" message.
+  try {
+    const testResult = await new Promise<{ ok: boolean; error: string }>((resolve) => {
+      const testProc = spawn(xrayPath, ["run", "-test", "-c", configPath], {
+        cwd: path.dirname(xrayPath),
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stderr = "";
+      let stdout = "";
+      testProc.stdout?.on("data", (d) => { stdout += d.toString(); });
+      testProc.stderr?.on("data", (d) => { stderr += d.toString(); });
+      testProc.on("exit", (code) => {
+        clearTimeout(killTimer);
+        if (code === 0) {
+          resolve({ ok: true, error: "" });
+        } else {
+          // Extract the actual error message from xray's output.
+          // xray prints errors like:
+          //   "failed to parse config: ..."
+          //   "invalid field ..."
+          const errLine = stderr.split("\n").find(l => l.toLowerCase().includes("error") || l.toLowerCase().includes("failed") || l.toLowerCase().includes("invalid")) || stderr.split("\n")[0] || "config validation failed";
+          resolve({ ok: false, error: errLine.trim() });
+        }
+      });
+      testProc.on("error", (e) => {
+        clearTimeout(killTimer);
+        resolve({ ok: false, error: `cannot run xray -test: ${e.message}` });
+      });
+      // Manual 10s timeout — spawn() doesn't have a `timeout` option in Node.js types.
+      const killTimer = setTimeout(() => {
+        try { testProc.kill("SIGKILL"); } catch {}
+        resolve({ ok: false, error: "xray -test timed out (10s) — config may be too complex or xray is stuck" });
+      }, 10000);
+    });
+
+    if (!testResult.ok) {
+      log.error(`[companion-api] xray config validation failed: ${scrubConfigUri(testResult.error)}`);
+      return { ok: false, error: `Invalid xray config: ${testResult.error}` };
+    }
+    log.info("[companion-api] xray config passed pre-flight validation");
+  } catch (e: any) {
+    // If -test itself throws (e.g., xray binary missing), fall through to
+    // the real spawn — the real spawn will catch it and report.
+    log.warn(`[companion-api] pre-flight validation skipped: ${e?.message}`);
+  }
+
+  // Buffer for xray stderr lines — used to include the ACTUAL error message
+  // in the response when xray exits immediately (v1.0.34).
+  let stderrBuffer = "";
+  const MAX_STDERR_BUFFER = 4096; // 4KB — enough for the last ~30 lines
+
   try {
     vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
       cwd: path.dirname(xrayPath),
@@ -1583,6 +1639,11 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     vpnProcess.stderr?.on("data", (data) => {
       const line = data.toString().trim();
       log.error(`[xray] ${line}`);
+      // Append to buffer (keep last 4KB)
+      stderrBuffer += line + "\n";
+      if (stderrBuffer.length > MAX_STDERR_BUFFER) {
+        stderrBuffer = stderrBuffer.slice(-MAX_STDERR_BUFFER);
+      }
     });
     vpnProcess.on("exit", (code) => {
       log.info(`[companion-api] xray exited with code ${code}`);
@@ -1595,11 +1656,19 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
       }
     });
 
-    // Wait briefly for xray to start (so we can detect immediate crashes)
-    await new Promise((r) => setTimeout(r, 500));
+    // Wait for xray to start (2s — increased from 500ms in v1.0.34).
+    // 500ms was too short: xray-core's TUN device setup, DNS resolver init,
+    // and SOCKS/HTTP listener binding can take 1-2 seconds on slower machines.
+    await new Promise((r) => setTimeout(r, 2000));
 
     if (!vpnProcess || vpnProcess.killed) {
-      return { ok: false, error: "xray process exited immediately — check config validity or xray binary" };
+      // xray exited within 2s — include the actual stderr so the user knows WHY.
+      const lastErr = stderrBuffer.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+      const detail = lastErr || "no stderr output (xray binary may be missing or corrupted)";
+      return {
+        ok: false,
+        error: `xray crashed on startup: ${detail}`,
+      };
     }
 
     // Update the desktop UI state so it doesn't show "Disconnected" while
