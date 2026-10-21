@@ -428,37 +428,64 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   if (!server) throw new Error("No server selected");
   log.info(`Starting xray-core: ${protocol} to ${server.host}:${server.port}`);
 
-  // Stop any existing xray process AND wait for ports to be released.
-  // FIX (v1.0.38 review): previously this only called kill("SIGTERM") + set
-  // vpnProcess=null without waiting. If a new xray spawned immediately, it
-  // could hit EADDRINUSE on ports 10808/10809 because the OS hadn't freed
-  // them yet. Now we delegate to stopVpnEngine() which does SIGTERM → 500ms
-  // wait → SIGKILL → 500ms wait → log "ports released".
-  if (vpnProcess) {
-    log.info("[startVpnEngine] existing xray process found — stopping it before spawning new one");
-    await stopVpnEngine();
+  // FIX (v1.0.38 audit v3 — BUG 5: vpnOperationInProgress mutex). Prevent
+  // concurrent startVpnEngine (desktop UI IPC) and startTunnelFromUri
+  // (companion API /api/tunnel/start) from spawning two xray processes at
+  // the same time. `quickConnectRunning` only guards quickConnect(); the
+  // desktop UI's startVpnEngine handler and the companion API's start
+  // endpoint can otherwise race and double-spawn.
+  if (vpnOperationInProgress) {
+    log.warn("startVpnEngine: another VPN operation in progress — rejecting");
+    throw new Error("Another VPN operation is in progress. Please wait.");
   }
-
-  // Build the REAL config (uses real credentials from configUri, or throws)
-  const config = buildXrayConfig(server, protocol, configUri);
-  const configPath = path.join(app.getPath("userData"), "xray-config.json");
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  log.info(`xray config written to: ${configPath}`);
-
-  const xrayPath = getXrayPath();
-  if (!fs.existsSync(xrayPath)) {
-    log.error(`xray binary not found at: ${xrayPath}`);
-    throw new Error("VPN engine binary missing");
+  // FIX (v1.0.38 audit v3 — BUG 1: xrayStuck). If a previous stopVpnEngine
+  // couldn't make the old xray exit (stuck in D-state / zombie), refuse to
+  // spawn a new one — otherwise two xray processes would fight over ports
+  // 10808/10809. The flag is cleared by a persistent exit listener on the
+  // stuck proc when it eventually dies.
+  if (xrayStuck) {
+    log.error("startVpnEngine: previous xray process is stuck (refuses to exit) — refusing to spawn a new one to avoid port conflict");
+    throw new Error("Previous xray process is stuck and refuses to exit. Please restart the app.");
   }
+  vpnOperationInProgress = true;
+  try {
+    // Stop any existing xray process AND wait for ports to be released.
+    // FIX (v1.0.38 review): previously this only called kill("SIGTERM") + set
+    // vpnProcess=null without waiting. If a new xray spawned immediately, it
+    // could hit EADDRINUSE on ports 10808/10809 because the OS hadn't freed
+    // them yet. Now we delegate to stopVpnEngine() which does SIGTERM → 500ms
+    // wait → SIGKILL → 500ms wait → log "ports released".
+    if (vpnProcess) {
+      log.info("[startVpnEngine] existing xray process found — stopping it before spawning new one");
+      await stopVpnEngine();
+    }
+    // Re-check xrayStuck after stopVpnEngine — stopVpnEngine may have set it
+    // if the old process refused to die. If so, refuse to spawn.
+    if (xrayStuck) {
+      log.error("startVpnEngine: stopVpnEngine could not kill the previous xray (stuck) — refusing to spawn a new one");
+      throw new Error("Previous xray process is stuck and refuses to exit. Please restart the app.");
+    }
 
-  // Spawn xray.exe
-  vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
-    cwd: path.dirname(xrayPath),
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const xrayPid = vpnProcess.pid;
-  log.info(`[startVpnEngine] xray process spawned, PID=${xrayPid}`);
+    // Build the REAL config (uses real credentials from configUri, or throws)
+    const config = buildXrayConfig(server, protocol, configUri);
+    const configPath = path.join(app.getPath("userData"), "xray-config.json");
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    log.info(`xray config written to: ${configPath}`);
+
+    const xrayPath = getXrayPath();
+    if (!fs.existsSync(xrayPath)) {
+      log.error(`xray binary not found at: ${xrayPath}`);
+      throw new Error("VPN engine binary missing");
+    }
+
+    // Spawn xray.exe
+    vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
+      cwd: path.dirname(xrayPath),
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const xrayPid = vpnProcess.pid;
+    log.info(`[startVpnEngine] xray process spawned, PID=${xrayPid}`);
 
   // ---------------------------------------------------------------------
   // STALE-RESPONSE GUARD (v1.0.38 — addresses user review):
@@ -654,6 +681,43 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
     log.info("xray-core starting — waiting for handshake");
   }
+  } finally {
+    // FIX (v1.0.38 audit v3 — BUG 5): clear the mutex on ALL exit paths
+    // (success, thrown error, or returned early). Exceptions propagate
+    // naturally after this finally block runs.
+    vpnOperationInProgress = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCP port-release probe (v1.0.38 audit v3 — BUG 3). Replaces the fixed
+// 300ms delay that was previously used after killing xray. Tries to CONNECT
+// to (host, port) up to `maxAttempts` times with `intervalMs` between tries.
+// If a connect succeeds, the port is STILL in use (TIME_WAIT lingering or a
+// stuck process). If connect fails (ECONNREFUSED, EADDRNOTAVAIL, timeout),
+// the port is free. Returns true if the port was confirmed free within the
+// attempt budget; false (and logs a warning) if the port is still in use.
+// NEVER blocks forever — worst case is maxAttempts * (intervalMs + 200ms).
+// ---------------------------------------------------------------------------
+async function waitForPortReleased(port: number, maxAttempts: number, intervalMs: number): Promise<boolean> {
+  const net = require("net");
+  let portFree = false;
+  for (let i = 0; i < maxAttempts; i++) {
+    if (i > 0) await new Promise((r) => setTimeout(r, intervalMs));
+    const stillOpen = await new Promise<boolean>((resolve) => {
+      const s = new net.Socket();
+      s.setTimeout(200);
+      s.once("connect", () => { s.destroy(); resolve(true); }); // port still in use
+      s.once("error", () => { s.destroy(); resolve(false); }); // port free
+      s.once("timeout", () => { s.destroy(); resolve(false); });
+      s.connect(port, "127.0.0.1");
+    });
+    if (!stillOpen) { portFree = true; break; }
+  }
+  if (!portFree) {
+    log.warn(`stopVpnEngine: port ${port} still in use after ${(maxAttempts * (intervalMs + 200))}ms — next spawn may fail with EADDRINUSE`);
+  }
+  return portFree;
 }
 
 async function stopVpnEngine(): Promise<void> {
@@ -670,18 +734,52 @@ async function stopVpnEngine(): Promise<void> {
 
   if (vpnProcess) {
     const proc = vpnProcess;
+    // Track whether the process actually emitted 'exit' so we can refuse to
+    // null `vpnProcess` (and refuse future spawns) if it didn't.
+    let didExit = false;
+    // Track whether the process is genuinely stuck (still alive after SIGKILL).
+    // If so, we skip the port probe + the vpnProcess=null assignment below,
+    // but still run the kill switch + state update at the end of the function.
+    let stuck = false;
+
     try {
       // FIX (v1.0.38 audit — Q2): previously we relied on `vpnProcess.killed`
       // which only tells us the SIGNAL was successfully delivered, NOT that
       // the process actually exited. Now we race SIGTERM + a 1s wait against
       // the actual 'exit' event. If 'exit' fires first, the process is really
       // dead. If the timeout fires first, we SIGKILL and wait for 'exit' again.
-      const exited = await new Promise<boolean>((resolve) => {
-        const exitTimeout = setTimeout(() => resolve(false), 1000);
-        proc.once("exit", () => {
+      //
+      // FIX (v1.0.38 audit v3 — BUG 2: listener leak): use a single named
+      // exit-listener that we can remove cleanly. Previously the first
+      // `proc.once("exit", ...)` was still registered when the 1s timeout
+      // won, and then we registered a SECOND `proc.once("exit", ...)` in the
+      // SIGKILL branch — leaving two listeners that both fired on the real
+      // exit event. Now we use one handler + a state flag.
+      let sigtermResolved = false;
+      const onExit = () => {
+        didExit = true;
+        if (!sigtermResolved) {
+          sigtermResolved = true;
           clearTimeout(exitTimeout);
-          resolve(true);
-        });
+          resolveSigterm(true);
+        } else {
+          clearTimeout(killTimeout);
+          resolveKill();
+        }
+      };
+      let resolveSigterm: (v: boolean) => void = () => {};
+      let resolveKill: () => void = () => {};
+      let exitTimeout: NodeJS.Timeout;
+      let killTimeout: NodeJS.Timeout;
+
+      const exited = await new Promise<boolean>((resolve) => {
+        resolveSigterm = resolve;
+        exitTimeout = setTimeout(() => {
+          if (sigtermResolved) return;
+          sigtermResolved = true;
+          resolve(false);
+        }, 1000);
+        proc.once("exit", onExit);
         try { proc.kill("SIGTERM"); } catch (e: any) {
           log.warn(`stopVpnEngine: SIGTERM failed (${e?.message}) — trying SIGKILL directly`);
           clearTimeout(exitTimeout);
@@ -690,32 +788,103 @@ async function stopVpnEngine(): Promise<void> {
         }
       });
 
-      if (!exited) {
-        // SIGTERM didn't cause exit within 1s → SIGKILL
+      if (!exited && !didExit) {
+        // SIGTERM didn't cause exit within 1s → SIGKILL.
         try { proc.kill("SIGKILL"); } catch {}
         // FIX: wait for the ACTUAL 'exit' event (up to 2s), not just a fixed
         // delay. This guarantees the process is dead before we release the slot.
         await new Promise<void>((resolve) => {
-          const killTimeout = setTimeout(() => {
+          resolveKill = resolve;
+          killTimeout = setTimeout(() => {
             log.warn("stopVpnEngine: xray did not exit within 2s of SIGKILL — giving up");
             resolve();
           }, 2000);
-          proc.once("exit", () => {
-            clearTimeout(killTimeout);
-            resolve();
-          });
+          // `onExit` is still registered from the SIGTERM phase; it will fire
+          // and clear the killTimeout + resolve this promise. No leak because
+          // we use the SAME handler.
         });
       }
 
-      // Additional 300ms for the OS to free TCP listening sockets on 10808/10809.
-      // (Even after exit, the kernel may briefly hold the ports in TIME_WAIT.)
-      await new Promise((r) => setTimeout(r, 300));
-      log.info("xray process stopped; ports 10808/10809 released");
+      // FIX (v1.0.38 audit v3 — BUG 1: zombie/stuck process). If the 2s
+      // SIGKILL timeout fired and the process STILL hasn't actually emitted
+      // 'exit', we MUST NOT set `vpnProcess = null` — the process may still
+      // be alive (stuck in D-state / uninterruptible sleep, or a zombie the
+      // kernel hasn't reaped). Spawning a new xray now would create two
+      // processes fighting over ports 10808/10809.
+      //
+      // Instead, register a PERSISTENT exit listener on the stuck proc (so
+      // when it eventually dies we clear the flag and null `vpnProcess`),
+      // and set `xrayStuck = true` so startVpnEngine / startTunnelFromUri
+      // refuse to spawn a new process until the stuck one dies.
+      if (!didExit) {
+        // Defensive: if `proc.killed` is false AND `exitCode` is null, the
+        // process is genuinely still alive (or a zombie not yet reaped).
+        // proc.exitCode is `null` while running and `number` after exit.
+        const procStillAlive = !proc.killed && proc.exitCode === null && proc.signalCode === null;
+        if (procStillAlive) {
+          log.error(
+            "stopVpnEngine: CRITICAL — xray process did not exit within 2s of SIGKILL " +
+            "(stuck in uninterruptible sleep or unreaped zombie). NOT clearing vpnProcess. " +
+            "Future startVpnEngine / startTunnelFromUri calls will be refused until the " +
+            "stuck process finally exits."
+          );
+          xrayStuck = true;
+          stuck = true;
+          // Persistent exit listener: clears the stuck flag + nulls vpnProcess
+          // when the process eventually dies (could be seconds, minutes, or
+          // never — but at least we won't spawn a second xray on top of it).
+          proc.once("exit", () => {
+            log.warn("stopVpnEngine: stuck xray process finally exited — clearing xrayStuck flag");
+            xrayStuck = false;
+            // Only null vpnProcess if it's STILL pointing at this stuck proc
+            // (a newer start may have been refused — see xrayStuck checks in
+            // startVpnEngine / startTunnelFromUri — in which case vpnProcess
+            // is still this stuck proc).
+            if (vpnProcess === proc) {
+              vpnProcess = null;
+            }
+            // Clean up the listener we registered for onExit above (it would
+            // otherwise be a no-op leak since `sigtermResolved` is already true).
+            try { proc.removeListener("exit", onExit); } catch {}
+          });
+        } else {
+          // Process is dead but exit event may have raced with our 2s timer.
+          log.warn("stopVpnEngine: xray process is dead (killed/exitCode set) but 'exit' event lagged — proceeding");
+        }
+      }
+
+      if (!stuck) {
+        // FIX (v1.0.38 audit v3 — BUG 3: 300ms wait is not port verification).
+        // Replace the fixed 300ms delay with an actual TCP probe to xray's HTTP
+        // proxy inbound (127.0.0.1:10809). The OS may take longer than 300ms to
+        // free the port (especially on Windows where TIME_WAIT can linger), and
+        // the next spawn would then hit EADDRINUSE. Probe up to 5 times with
+        // 100ms intervals; if the port is STILL open after ~1s, log a warning
+        // (the next spawn may fail) but proceed — do NOT block forever.
+        await waitForPortReleased(10809, 5, 100);
+        // Clean up the SIGTERM-phase exit listener if it never fired (process
+        // exited via kill-code path that didn't trigger our handler).
+        try { proc.removeListener("exit", onExit); } catch {}
+        log.info("xray process stopped; ports 10808/10809 released");
+      } else {
+        // Stuck process — ports are still held by it; skip the probe.
+        // `onExit` is intentionally NOT removed here because we want the
+        // persistent exit listener we just registered to be the one that
+        // cleans up `vpnProcess` when the stuck proc finally dies. (Note:
+        // `onExit` itself becomes a no-op once `sigtermResolved` is true,
+        // so leaving it registered is harmless.)
+      }
     } catch (e) {
       log.error("Error killing xray:", e);
     }
-    vpnProcess = null;
+    // Only null `vpnProcess` if the process actually exited. If it's stuck,
+    // we set `xrayStuck = true` above and registered a persistent exit
+    // listener that will null `vpnProcess` when it finally dies.
+    if (didExit && !stuck) {
+      vpnProcess = null;
+    }
   }
+
 
   // If kill switch is enabled, block all non-tunnel traffic until user reconnects.
   // On Windows: use netsh advfirewall to add a block rule (requires admin).
@@ -783,6 +952,28 @@ let currentVerifyAttempt = 0;
 // ports 10808/10809.
 // ---------------------------------------------------------------------------
 let quickConnectRunning = false;
+
+// ---------------------------------------------------------------------------
+// VPN operation mutex (v1.0.38 audit v3 — BUG 5: prevent concurrent
+// startVpnEngine (desktop UI) and startTunnelFromUri (companion API) from
+// spawning two xray processes simultaneously). `quickConnectRunning` only
+// guards quickConnect(); the desktop UI's startVpnEngine IPC handler and
+// the companion API's /api/tunnel/start endpoint can otherwise race.
+// Both start paths set this flag at the top and clear it in a `finally`.
+// ---------------------------------------------------------------------------
+let vpnOperationInProgress = false;
+
+// ---------------------------------------------------------------------------
+// xray-stuck flag (v1.0.38 audit v3 — BUG 1: if SIGKILL doesn't make xray
+// exit within 2s (stuck in uninterruptible sleep / D-state, or zombie that
+// the kernel hasn't reaped), we MUST NOT set `vpnProcess = null` — otherwise
+// the next startVpnEngine spawns a SECOND xray and the two fight over
+// ports 10808/10809. Instead, set this flag and refuse to spawn until the
+// exit event finally fires (registered persistently on the stuck proc), at
+// which point the flag is cleared. startVpnEngine + startTunnelFromUri
+// both check this flag before spawning.
+// ---------------------------------------------------------------------------
+let xrayStuck = false;
 
 // Tunnel health monitoring — checks every 30s if the tunnel is still alive.
 // If the tunnel dies:
@@ -1820,213 +2011,236 @@ function scrubConfigUri(s: string): string {
 // companion API's /api/tunnel/start endpoint. Shares the global vpnProcess
 // variable with the desktop UI flow so the two can't double-spawn xray.
 async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; error?: string }> {
-  // FIX (v1.0.38 audit — Q11): previously this function did its OWN
-  // kill+null on vpnProcess without going through stopVpnEngine, which meant:
-  //   - No `currentVerifyAttempt++` → stale guard couldn't detect this path
-  //   - No wait for the process to actually die → EADDRINUSE risk
-  //   - No port-release delay
-  // Now we delegate to stopVpnEngine() which does all of the above. This also
-  // means the companion API path and the desktop UI path share the SAME
-  // stale-guard counter, so a verification callback from either path can be
-  // invalidated by a stop or a new start from the other path.
-  await stopVpnEngine();
-
-  // Build the REAL config (uses real credentials from configUri, or throws)
-  let config: object;
-  try {
-    config = buildXrayConfigFromUri(configUri);
-  } catch (e: any) {
-    // Scrub just in case the error message echoes part of the URI
-    log.warn(`[companion-api] /api/tunnel/start config build failed: ${scrubConfigUri(e?.message || String(e))}`);
-    return { ok: false, error: e?.message || "Failed to build xray config from URI" };
+  // FIX (v1.0.38 audit v3 — BUG 5: mutex). Prevent concurrent xray spawn
+  // when the companion API and the desktop UI race for the global vpnProcess.
+  if (vpnOperationInProgress) {
+    log.warn("[companion-api] startTunnelFromUri: another VPN operation in progress — rejecting");
+    return { ok: false, error: "Another VPN operation is in progress. Please wait." };
   }
-
-  const configPath = path.join(app.getPath("userData"), "xray-config.json");
-  try {
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-  } catch (e: any) {
-    log.error(`[companion-api] Failed to write xray config: ${e?.message}`);
-    return { ok: false, error: `Failed to write xray config: ${e?.message}` };
+  // FIX (v1.0.38 audit v3 — BUG 1: xrayStuck). Refuse to spawn while a
+  // previous xray process is stuck (didn't exit after SIGKILL).
+  if (xrayStuck) {
+    log.warn("[companion-api] startTunnelFromUri: xray process is stuck — refusing to spawn");
+    return { ok: false, error: "Previous xray process is stuck. Please restart the app." };
   }
-  log.info("[companion-api] xray config written (configUri REDACTED)");
-
-  const xrayPath = getXrayPath();
-  if (!fs.existsSync(xrayPath)) {
-    log.error(`[companion-api] xray binary not found at: ${xrayPath}`);
-    return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
-  }
-
-  // PRE-FLIGHT VALIDATION (v1.0.34): run `xray run -test -c config.json` to
-  // validate the config WITHOUT starting the tunnel. This catches 90% of
-  // config errors (invalid fields, unknown protocols, bad credentials format)
-  // and returns the ACTUAL xray error message to the UI instead of the
-  // generic "xray process exited immediately" message.
+  vpnOperationInProgress = true;
   try {
-    const testResult = await new Promise<{ ok: boolean; error: string }>((resolve) => {
-      const testProc = spawn(xrayPath, ["run", "-test", "-c", configPath], {
+    // FIX (v1.0.38 audit — Q11): previously this function did its OWN
+    // kill+null on vpnProcess without going through stopVpnEngine, which meant:
+    //   - No `currentVerifyAttempt++` → stale guard couldn't detect this path
+    //   - No wait for the process to actually die → EADDRINUSE risk
+    //   - No port-release delay
+    // Now we delegate to stopVpnEngine() which does all of the above. This also
+    // means the companion API path and the desktop UI path share the SAME
+    // stale-guard counter, so a verification callback from either path can be
+    // invalidated by a stop or a new start from the other path.
+    await stopVpnEngine();
+
+    // Re-check xrayStuck after stopVpnEngine — stopVpnEngine may have set it
+    // if the old process didn't exit even after SIGKILL.
+    if (xrayStuck) {
+      log.warn("[companion-api] startTunnelFromUri: xray stuck after stopVpnEngine — refusing to spawn");
+      return { ok: false, error: "Previous xray process is stuck. Please restart the app." };
+    }
+
+    // Build the REAL config (uses real credentials from configUri, or throws)
+    let config: object;
+    try {
+      config = buildXrayConfigFromUri(configUri);
+    } catch (e: any) {
+      // Scrub just in case the error message echoes part of the URI
+      log.warn(`[companion-api] /api/tunnel/start config build failed: ${scrubConfigUri(e?.message || String(e))}`);
+      return { ok: false, error: e?.message || "Failed to build xray config from URI" };
+    }
+
+    const configPath = path.join(app.getPath("userData"), "xray-config.json");
+    try {
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    } catch (e: any) {
+      log.error(`[companion-api] Failed to write xray config: ${e?.message}`);
+      return { ok: false, error: `Failed to write xray config: ${e?.message}` };
+    }
+    log.info("[companion-api] xray config written (configUri REDACTED)");
+
+    const xrayPath = getXrayPath();
+    if (!fs.existsSync(xrayPath)) {
+      log.error(`[companion-api] xray binary not found at: ${xrayPath}`);
+      return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
+    }
+
+    // PRE-FLIGHT VALIDATION (v1.0.34): run `xray run -test -c config.json` to
+    // validate the config WITHOUT starting the tunnel. This catches 90% of
+    // config errors (invalid fields, unknown protocols, bad credentials format)
+    // and returns the ACTUAL xray error message to the UI instead of the
+    // generic "xray process exited immediately" message.
+    try {
+      const testResult = await new Promise<{ ok: boolean; error: string }>((resolve) => {
+        const testProc = spawn(xrayPath, ["run", "-test", "-c", configPath], {
+          cwd: path.dirname(xrayPath),
+          windowsHide: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stderr = "";
+        let stdout = "";
+        testProc.stdout?.on("data", (d) => { stdout += d.toString(); });
+        testProc.stderr?.on("data", (d) => { stderr += d.toString(); });
+        testProc.on("exit", (code) => {
+          clearTimeout(killTimer);
+          if (code === 0) {
+            resolve({ ok: true, error: "" });
+          } else {
+            // Extract the actual error message from xray's output.
+            // xray prints errors like:
+            //   "failed to parse config: ..."
+            //   "invalid field ..."
+            const errLine = stderr.split("\n").find(l => l.toLowerCase().includes("error") || l.toLowerCase().includes("failed") || l.toLowerCase().includes("invalid")) || stderr.split("\n")[0] || "config validation failed";
+            resolve({ ok: false, error: errLine.trim() });
+          }
+        });
+        testProc.on("error", (e) => {
+          clearTimeout(killTimer);
+          resolve({ ok: false, error: `cannot run xray -test: ${e.message}` });
+        });
+        // Manual 10s timeout — spawn() doesn't have a `timeout` option in Node.js types.
+        const killTimer = setTimeout(() => {
+          try { testProc.kill("SIGKILL"); } catch {}
+          resolve({ ok: false, error: "xray -test timed out (10s) — config may be too complex or xray is stuck" });
+        }, 10000);
+      });
+
+      if (!testResult.ok) {
+        log.error(`[companion-api] xray config validation failed: ${scrubConfigUri(testResult.error)}`);
+        return { ok: false, error: `Invalid xray config: ${testResult.error}` };
+      }
+      log.info("[companion-api] xray config passed pre-flight validation");
+    } catch (e: any) {
+      // If -test itself throws (e.g., xray binary missing), fall through to
+      // the real spawn — the real spawn will catch it and report.
+      log.warn(`[companion-api] pre-flight validation skipped: ${e?.message}`);
+    }
+
+    // Buffer for xray stderr lines — used to include the ACTUAL error message
+    // in the response when xray exits immediately (v1.0.34).
+    let stderrBuffer = "";
+    const MAX_STDERR_BUFFER = 4096; // 4KB — enough for the last ~30 lines
+
+    try {
+      vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
         cwd: path.dirname(xrayPath),
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let stderr = "";
-      let stdout = "";
-      testProc.stdout?.on("data", (d) => { stdout += d.toString(); });
-      testProc.stderr?.on("data", (d) => { stderr += d.toString(); });
-      testProc.on("exit", (code) => {
-        clearTimeout(killTimer);
-        if (code === 0) {
-          resolve({ ok: true, error: "" });
-        } else {
-          // Extract the actual error message from xray's output.
-          // xray prints errors like:
-          //   "failed to parse config: ..."
-          //   "invalid field ..."
-          const errLine = stderr.split("\n").find(l => l.toLowerCase().includes("error") || l.toLowerCase().includes("failed") || l.toLowerCase().includes("invalid")) || stderr.split("\n")[0] || "config validation failed";
-          resolve({ ok: false, error: errLine.trim() });
+      // FIX (v1.0.38 audit — Q11): capture PID + attemptId so stderr/exit
+      // handlers from THIS spawn can be detected as stale if a new spawn
+      // (from either the companion API or the desktop UI) supersedes them.
+      const companionXrayPid = vpnProcess.pid;
+      currentVerifyAttempt++;
+      const companionAttemptId = currentVerifyAttempt;
+
+      vpnProcess.stdout?.on("data", (data) => {
+        log.info(`[xray] ${data.toString().trim()}`);
+      });
+      vpnProcess.stderr?.on("data", (data) => {
+        const line = data.toString().trim();
+        log.error(`[xray] ${line}`);
+        // STALE GUARD: drop stderr from a superseded process.
+        if (companionAttemptId !== currentVerifyAttempt) {
+          log.info(`[companion-api] stale stderr from attempt ${companionAttemptId} — dropping: ${line.slice(0, 80)}`);
+          return;
+        }
+        // Append to buffer (keep last 4KB)
+        stderrBuffer += line + "\n";
+        if (stderrBuffer.length > MAX_STDERR_BUFFER) {
+          stderrBuffer = stderrBuffer.slice(-MAX_STDERR_BUFFER);
         }
       });
-      testProc.on("error", (e) => {
-        clearTimeout(killTimer);
-        resolve({ ok: false, error: `cannot run xray -test: ${e.message}` });
+      vpnProcess.on("exit", (code) => {
+        log.info(`[companion-api] xray exited with code ${code}`);
+        // STALE GUARD: don't let a stale exit overwrite a newer connection state.
+        if (companionAttemptId !== currentVerifyAttempt) {
+          log.info(`[companion-api] stale exit from attempt ${companionAttemptId} — dropping`);
+          return;
+        }
+        // Only null vpnProcess if THIS is still the active process.
+        if (vpnProcess && vpnProcess.pid === companionXrayPid) {
+          vpnProcess = null;
+        }
+        // If the desktop UI thought it was connected, mark it disconnected now.
+        const vpn = store.get("vpn");
+        if (vpn.connected) {
+          store.set("vpn", { ...vpn, connected: false, startedAt: null });
+          mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
+        }
       });
-      // Manual 10s timeout — spawn() doesn't have a `timeout` option in Node.js types.
-      const killTimer = setTimeout(() => {
-        try { testProc.kill("SIGKILL"); } catch {}
-        resolve({ ok: false, error: "xray -test timed out (10s) — config may be too complex or xray is stuck" });
-      }, 10000);
-    });
 
-    if (!testResult.ok) {
-      log.error(`[companion-api] xray config validation failed: ${scrubConfigUri(testResult.error)}`);
-      return { ok: false, error: `Invalid xray config: ${testResult.error}` };
-    }
-    log.info("[companion-api] xray config passed pre-flight validation");
-  } catch (e: any) {
-    // If -test itself throws (e.g., xray binary missing), fall through to
-    // the real spawn — the real spawn will catch it and report.
-    log.warn(`[companion-api] pre-flight validation skipped: ${e?.message}`);
-  }
+      // Wait for xray to start (2s — increased from 500ms in v1.0.34).
+      // 500ms was too short: xray-core's TUN device setup, DNS resolver init,
+      // and SOCKS/HTTP listener binding can take 1-2 seconds on slower machines.
+      await new Promise((r) => setTimeout(r, 2000));
 
-  // Buffer for xray stderr lines — used to include the ACTUAL error message
-  // in the response when xray exits immediately (v1.0.34).
-  let stderrBuffer = "";
-  const MAX_STDERR_BUFFER = 4096; // 4KB — enough for the last ~30 lines
+      if (!vpnProcess || vpnProcess.killed) {
+        // xray exited within 2s — include the actual stderr so the user knows WHY.
+        const lastErr = stderrBuffer.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+        const detail = lastErr || "no stderr output (xray binary may be missing or corrupted)";
+        return {
+          ok: false,
+          error: `xray crashed on startup: ${detail}`,
+        };
+      }
 
-  try {
-    vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
-      cwd: path.dirname(xrayPath),
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    // FIX (v1.0.38 audit — Q11): capture PID + attemptId so stderr/exit
-    // handlers from THIS spawn can be detected as stale if a new spawn
-    // (from either the companion API or the desktop UI) supersedes them.
-    const companionXrayPid = vpnProcess.pid;
-    currentVerifyAttempt++;
-    const companionAttemptId = currentVerifyAttempt;
-
-    vpnProcess.stdout?.on("data", (data) => {
-      log.info(`[xray] ${data.toString().trim()}`);
-    });
-    vpnProcess.stderr?.on("data", (data) => {
-      const line = data.toString().trim();
-      log.error(`[xray] ${line}`);
-      // STALE GUARD: drop stderr from a superseded process.
-      if (companionAttemptId !== currentVerifyAttempt) {
-        log.info(`[companion-api] stale stderr from attempt ${companionAttemptId} — dropping: ${line.slice(0, 80)}`);
-        return;
-      }
-      // Append to buffer (keep last 4KB)
-      stderrBuffer += line + "\n";
-      if (stderrBuffer.length > MAX_STDERR_BUFFER) {
-        stderrBuffer = stderrBuffer.slice(-MAX_STDERR_BUFFER);
-      }
-    });
-    vpnProcess.on("exit", (code) => {
-      log.info(`[companion-api] xray exited with code ${code}`);
-      // STALE GUARD: don't let a stale exit overwrite a newer connection state.
-      if (companionAttemptId !== currentVerifyAttempt) {
-        log.info(`[companion-api] stale exit from attempt ${companionAttemptId} — dropping`);
-        return;
-      }
-      // Only null vpnProcess if THIS is still the active process.
-      if (vpnProcess && vpnProcess.pid === companionXrayPid) {
-        vpnProcess = null;
-      }
-      // If the desktop UI thought it was connected, mark it disconnected now.
+      // Update the desktop UI state so it doesn't show "Disconnected" while
+      // the companion API is actively running a tunnel. Verification is done
+      // separately via /api/tunnel/verify.
       const vpn = store.get("vpn");
-      if (vpn.connected) {
-        store.set("vpn", { ...vpn, connected: false, startedAt: null });
-        mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
-      }
-    });
-
-    // Wait for xray to start (2s — increased from 500ms in v1.0.34).
-    // 500ms was too short: xray-core's TUN device setup, DNS resolver init,
-    // and SOCKS/HTTP listener binding can take 1-2 seconds on slower machines.
-    await new Promise((r) => setTimeout(r, 2000));
-
-    if (!vpnProcess || vpnProcess.killed) {
-      // xray exited within 2s — include the actual stderr so the user knows WHY.
-      const lastErr = stderrBuffer.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
-      const detail = lastErr || "no stderr output (xray binary may be missing or corrupted)";
-      return {
-        ok: false,
-        error: `xray crashed on startup: ${detail}`,
-      };
-    }
-
-    // Update the desktop UI state so it doesn't show "Disconnected" while
-    // the companion API is actively running a tunnel. Verification is done
-    // separately via /api/tunnel/verify.
-    const vpn = store.get("vpn");
-    store.set("vpn", {
-      ...vpn,
-      connected: false, // NOT verified yet — /api/tunnel/verify will set this
-      protocol: "companion-api",
-      startedAt: Date.now(),
-      configUri: null, // never persist the raw URI
-      exitIp: null,
-      exitCountry: null,
-    });
-    mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
-
-    log.info("[companion-api] xray spawned successfully (configUri REDACTED)");
-
-    // CRITICAL: Set Electron browser proxy to route through xray's SOCKS5
-    try {
-      await session.defaultSession.setProxy({
-        proxyRules: "socks5://127.0.0.1:10808",
+      store.set("vpn", {
+        ...vpn,
+        connected: false, // NOT verified yet — /api/tunnel/verify will set this
+        protocol: "companion-api",
+        startedAt: Date.now(),
+        configUri: null, // never persist the raw URI
+        exitIp: null,
+        exitCountry: null,
       });
-      log.info("[companion-api] Browser proxy set to socks5://127.0.0.1:10808");
-    } catch (e: any) {
-      log.warn(`[companion-api] Failed to set browser proxy: ${e?.message}`);
-    }
+      mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
 
-    return { ok: true };
-  } catch (e: any) {
-    log.error(`[companion-api] Failed to spawn xray: ${e?.message}`);
-    return { ok: false, error: `Failed to spawn xray: ${e?.message}` };
+      log.info("[companion-api] xray spawned successfully (configUri REDACTED)");
+
+      // CRITICAL: Set Electron browser proxy to route through xray's SOCKS5
+      try {
+        await session.defaultSession.setProxy({
+          proxyRules: "socks5://127.0.0.1:10808",
+        });
+        log.info("[companion-api] Browser proxy set to socks5://127.0.0.1:10808");
+      } catch (e: any) {
+        log.warn(`[companion-api] Failed to set browser proxy: ${e?.message}`);
+      }
+
+      return { ok: true };
+    } catch (e: any) {
+      log.error(`[companion-api] Failed to spawn xray: ${e?.message}`);
+      return { ok: false, error: `Failed to spawn xray: ${e?.message}` };
+    }
+  } finally {
+    // FIX (v1.0.38 audit v3 — BUG 5): always release the mutex, even on
+    // early returns or thrown errors. Without this, a single failed
+    // startTunnelFromUri would block all future VPN operations.
+    vpnOperationInProgress = false;
   }
 }
 
 // Stop the xray process (shared by the API and the desktop UI flow).
 async function stopTunnel(): Promise<{ ok: boolean }> {
   log.info("[companion-api] /api/tunnel/stop — stopping xray-core…");
-  stopHealthMonitoring();
-  if (vpnProcess) {
-    try {
-      vpnProcess.kill("SIGTERM");
-      // Give it 500ms to exit gracefully
-      await new Promise((r) => setTimeout(r, 500));
-      if (!vpnProcess.killed) {
-        try { vpnProcess.kill("SIGKILL"); } catch {}
-      }
-    } catch (e: any) {
-      log.error(`[companion-api] Error killing xray: ${e?.message}`);
-    }
-    vpnProcess = null;
-  }
+  // FIX (v1.0.38 audit v3 — BUG 4): previously stopTunnel did its own
+  // kill+null on vpnProcess, bypassing stopVpnEngine. This meant:
+  //   - No `currentVerifyAttempt++` → stale guard couldn't detect this path
+  //   - No wait for the actual exit event → EADDRINUSE risk
+  //   - No port-release wait/probe
+  // Now we delegate to stopVpnEngine() — same as startTunnelFromUri does.
+  // This ensures the companion API stop path and the desktop UI stop path
+  // use the SAME coordinated logic (stale-guard counter bump, exit-event
+  // wait, port-release probe).
+  await stopVpnEngine();
 
   // Clear the browser proxy
   try {
