@@ -387,123 +387,42 @@ function buildXrayConfig(server: VpnState["server"], protocol: string, configUri
 
 import { randomUUID as cryptoRandomUUID } from "crypto";
 import { parseConfigUri } from "./config-parser";
+import {
+  verifyTunnelTraffic,
+  fetchRealIp,
+  getTunnelProxyUrl,
+  type VerifyTunnelResult,
+} from "./tunnel-verifier";
 
 // ---------------------------------------------------------------------------
 // Tunnel traffic verification — top-level (reused by both the desktop UI's
 // startVpnEngine() startup flow AND the companion control API's
 // /api/tunnel/verify endpoint).
 //
-// Strategy: do a real SOCKS5 → TLS → HTTP GET through xray's local SOCKS5
-// proxy (127.0.0.1:10808) to https://www.cloudflare.com/cdn-cgi/trace.
-// If we get a response containing "ip=", the tunnel is verified working
-// and we extract the exit IP + country.
+// Strategy: do a real HTTP GET through xray's HTTP proxy inbound
+// (127.0.0.1:10809) to https://www.cloudflare.com/cdn-cgi/trace, AND a direct
+// (non-proxied) GET to fetch the device's real IP. If both succeed and the
+// exit IP differs from the real IP, the tunnel is verified working. If they
+// match, the tunnel is leaking (xray is bypassing itself) → verified=false.
 //
-// This is the ONLY way to prove the tunnel actually carries traffic —
-// NOT just checking if the SOCKS port is open (that only proves xray's
-// inbound is ready, not that the outbound to the VPN server works).
+// This is the ONLY way to prove the tunnel actually carries traffic — NOT
+// just checking if the SOCKS port is open (that only proves xray's inbound
+// is ready, not that the outbound to the VPN server works).
+//
+// CRITICAL FIX (VERIFY-TUNNEL-FIX): the previous implementation set
+// process.env.HTTP_PROXY and called Node's built-in fetch() — but undici's
+// fetch() SILENTLY IGNORES HTTP_PROXY/HTTPS_PROXY env vars. So the
+// "verification" was always making a DIRECT request to cloudflare and
+// reporting "connected" even with a completely broken tunnel. The new
+// implementation in tunnel-verifier.ts uses node-fetch + https-proxy-agent
+// to FORCE the request through xray's HTTP proxy inbound.
+//
+// The implementation lives in ./tunnel-verifier.ts (no electron dependency,
+// unit-testable). main.ts re-exports it via the imports above.
 // ---------------------------------------------------------------------------
-type VerifyTunnelResult = {
-  verified: boolean;
-  exitIp: string | null;
-  exitCountry: string | null;
-  latencyMs: number | null;
-  error?: string;
-};
 
-async function verifyTunnelTraffic(): Promise<VerifyTunnelResult> {
-  // Use HTTP fetch through the SOCKS5 proxy instead of raw SOCKS5 + TLS.
-  // The previous raw SOCKS5 implementation was failing with ECONNRESET
-  // because it manually implemented the SOCKS5 protocol + TLS handshake,
-  // which is error-prone. Using Node's built-in fetch with a proxy agent
-  // is more reliable.
-  //
-  // We use the HTTP proxy (port 10809) instead of SOCKS5 (port 10808)
-  // because Node's fetch() supports HTTP proxies via env vars natively.
-  const startTime = Date.now();
-  try {
-    // Set proxy env vars for this request
-    const prevHttpProxy = process.env.HTTP_PROXY;
-    const prevHttpsProxy = process.env.HTTPS_PROXY;
-    process.env.HTTP_PROXY = "http://127.0.0.1:10809";
-    process.env.HTTPS_PROXY = "http://127.0.0.1:10809";
-
-    // Try fetching through the proxy
-    const resp = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
-      signal: AbortSignal.timeout(10000),
-    });
-
-    // Restore env vars
-    process.env.HTTP_PROXY = prevHttpProxy || "";
-    process.env.HTTPS_PROXY = prevHttpsProxy || "";
-
-    if (!resp.ok) {
-      return {
-        verified: false,
-        exitIp: null,
-        exitCountry: null,
-        latencyMs: Date.now() - startTime,
-        error: `HTTP ${resp.status} through proxy`,
-      };
-    }
-
-    const text = await resp.text();
-    const latencyMs = Date.now() - startTime;
-
-    // Validate response — must contain "ip=" to prove traffic flowed
-    if (text.includes("ip=")) {
-      const exitIp = text.match(/ip=([^\r\n]+)/)?.[1]?.trim() || "";
-      const exitCountry = text.match(/loc=([^\r\n]+)/)?.[1]?.trim() || "";
-      return {
-        verified: true,
-        exitIp: exitIp || null,
-        exitCountry: exitCountry || null,
-        latencyMs,
-      };
-    } else {
-      return {
-        verified: false,
-        exitIp: null,
-        exitCountry: null,
-        latencyMs,
-        error: "Proxy responded but no valid trace data",
-      };
-    }
-  } catch (e: any) {
-    // Restore env vars on error too
-    process.env.HTTP_PROXY = "";
-    process.env.HTTPS_PROXY = "";
-    return {
-      verified: false,
-      exitIp: null,
-      exitCountry: null,
-      latencyMs: Date.now() - startTime,
-      error: e?.message || String(e),
-    };
-  }
-}
-
-// Fetch the device's REAL public IP by doing a DIRECT (non-proxied) HTTPS
-// GET to cloudflare/cdn-cgi/trace. Used by /api/tunnel/verify to compare
-// against the exit IP — if they match, traffic is NOT going through the
-// tunnel (leak). If they differ, tunnel is verified working.
-async function fetchRealIp(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const req = https.get(
-      "https://www.cloudflare.com/cdn-cgi/trace",
-      { timeout: 8000 },
-      (res: http.IncomingMessage) => {
-        let data = "";
-        res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-        res.on("end", () => {
-          const match = data.match(/ip=([^\r\n]+)/);
-          resolve(match ? match[1].trim() : null);
-        });
-      }
-    );
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => { req.destroy(); resolve(null); });
-  });
-}
+// (VerifyTunnelResult type + verifyTunnelTraffic() + fetchRealIp() are now
+// imported from ./tunnel-verifier — see imports above.)
 
 async function startVpnEngine(server: VpnState["server"], protocol: string, configUri?: string | null): Promise<void> {
   if (!server) throw new Error("No server selected");
@@ -533,15 +452,18 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
+  log.info(`[startVpnEngine] xray process spawned, PID=${vpnProcess.pid}`);
 
   // Track xray's health — only mark "connected" after REAL HTTP request through proxy
   let handshakeConfirmed = false;
   let startupError = "";
+  log.info("[startVpnEngine] waiting 5s before verification...");
   const startupTimeout = setTimeout(() => {
     if (!handshakeConfirmed && !startupError) {
       // xray is still alive after 5s — do a REAL HTTP request through the
-      // SOCKS proxy to verify traffic actually flows to the destination.
-      // This is more honest than just checking if the SOCKS port is open.
+      // HTTP proxy inbound (127.0.0.1:10809) to verify traffic actually flows
+      // to the destination. This is more honest than just checking if the SOCKS
+      // port is open.
       verifyHttpThroughProxy().then((verified) => {
         if (verified && !handshakeConfirmed && !startupError) {
           handshakeConfirmed = true;
@@ -589,7 +511,9 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   async function verifyHttpThroughProxy(): Promise<boolean> {
     // Make this function accessible to health monitoring (top-level ref)
     verifyHttpThroughProxyRef = verifyHttpThroughProxy;
+    log.info(`[startVpnEngine] starting HTTP verification through proxy ${getTunnelProxyUrl()}...`);
     const result = await verifyTunnelTraffic();
+    log.info(`[startVpnEngine] verification result: verified=${result.verified} exitIp=${result.exitIp} realIp=${result.realIp} leak=${result.leakDetected}`);
     if (result.verified && result.exitIp) {
       log.info(`Traffic verification: exit IP=${result.exitIp}, country=${result.exitCountry} — tunnel verified (latency=${result.latencyMs}ms)`);
       // Store exit IP + country in VPN state
@@ -681,7 +605,14 @@ async function stopVpnEngine(): Promise<void> {
       // Give it 500ms to exit gracefully
       await new Promise((r) => setTimeout(r, 500));
       if (!vpnProcess.killed) {
-        vpnProcess.kill("SIGKILL");
+        try { vpnProcess.kill("SIGKILL"); } catch {}
+        // FIX (VERIFY-TUNNEL-FIX): wait an additional 500ms after SIGKILL so
+        // xray's TCP listening sockets on 10808/10809 are fully released by
+        // the kernel. Without this delay, the next startVpnEngine() call may
+        // spawn xray before the OS has freed the ports — causing EADDRINUSE
+        // and a silent failure to bind the proxy inbound.
+        await new Promise((r) => setTimeout(r, 500));
+        log.info("xray ports released (10808/10809 free)");
       }
     } catch (e) {
       log.error("Error killing xray:", e);
@@ -1608,7 +1539,18 @@ async function tryQuickConnectTier(
 
       // startVpnEngine performs pre-flight validation; wait for the state
       // machine to verify the tunnel before considering this config successful.
-      await new Promise((resolve) => setTimeout(resolve, 7000));
+      //
+      // FIX (VERIFY-TUNNEL-FIX): bumped from 7s to 20s. The previous 7s wait
+      // was too short — startVpnEngine schedules the verification via
+      // setTimeout(5000) (5s after spawn), and the verification itself can
+      // take up to 10s (TRACE_TIMEOUT_MS) for the proxy fetch + 8s for the
+      // real-IP fetch (run in parallel). At 7s we were checking
+      // store.get("vpn.connected") BEFORE verification had even started,
+      // so EVERY config reported "not connected" — quick-connect would skip
+      // working configs and fall through to the next source list. 20s gives
+      // 5s (internal setTimeout) + 10s (proxy fetch) + 5s buffer (SOCKS
+      // handshake + TLS + HTTP round-trip + real-IP fetch in parallel).
+      await new Promise((resolve) => setTimeout(resolve, 20000));
       const vpnState = store.get("vpn");
 
       if (vpnState.connected) {
@@ -1973,15 +1915,22 @@ function getTunnelStatus(): { running: boolean; exitIp: string | null; realIp: s
   };
 }
 
-// Verify the tunnel by doing a real HTTP request through xray's SOCKS5 proxy
-// (127.0.0.1:10808) to cloudflare/cdn-cgi/trace, AND a direct (non-proxied)
-// request to get the real IP. If they differ, traffic is going through the
-// tunnel → verified. If they match (or either is null), NOT verified.
+// Verify the tunnel by doing a real HTTP request through xray's HTTP proxy
+// inbound (127.0.0.1:10809) to cloudflare/cdn-cgi/trace, AND a direct
+// (non-proxied) request to get the real IP. If they differ, traffic is going
+// through the tunnel → verified. If they match (or either is null), NOT verified.
+//
+// Note: as of VERIFY-TUNNEL-FIX, verifyTunnelTraffic() now ALSO fetches the
+// real IP internally and exposes `leakDetected` on the result. We still
+// re-fetch realIp here so the API response includes it for the caller, but
+// the verification decision now uses `leakDetected` directly (defence in
+// depth — both the wrapper logic and the verifier's own check agree).
 async function handleTunnelVerify(): Promise<{
   trafficVerified: boolean;
   exitIp: string | null;
   realIp: string | null;
   latencyMs: number | null;
+  leakDetected: boolean;
   error?: string;
 }> {
   if (!vpnProcess || vpnProcess.killed) {
@@ -1993,25 +1942,26 @@ async function handleTunnelVerify(): Promise<{
       exitIp: null,
       realIp,
       latencyMs: null,
+      leakDetected: false,
       error: "No active tunnel — call POST /api/tunnel/start first",
     };
   }
 
-  // Run both probes in parallel — they don't depend on each other.
-  const [trafficResult, realIp] = await Promise.all([
-    verifyTunnelTraffic(),
-    fetchRealIp(),
-  ]);
+  // verifyTunnelTraffic() runs both probes in parallel internally (proxy
+  // fetch + direct real-IP fetch) and returns the leak comparison. We
+  // don't need to call fetchRealIp() separately — the result includes it.
+  const trafficResult = await verifyTunnelTraffic();
 
   const exitIp = trafficResult.exitIp;
-  // Verification rule: traffic must have flowed (verified=true), AND the exit
-  // IP must differ from the real IP. If they're the same, the tunnel is
-  // leaking or xray is bypassing itself.
+  const realIp = trafficResult.realIp;
+  const leakDetected = trafficResult.leakDetected;
+
+  // Verification rule: traffic must have flowed (verified=true from the
+  // proxy fetch), AND no leak was detected (exit IP differs from real IP).
+  // The verifier already encodes this in `trafficResult.verified`, but we
+  // re-check here as defence-in-depth in case the verifier's logic changes.
   const trafficVerified =
-    trafficResult.verified &&
-    !!exitIp &&
-    !!realIp &&
-    exitIp !== realIp;
+    trafficResult.verified && !!exitIp && !leakDetected;
 
   // Reflect the verified exit IP in the desktop UI state too, so the UI
   // stays in sync with what the companion API just measured.
@@ -2035,6 +1985,7 @@ async function handleTunnelVerify(): Promise<{
     exitIp,
     realIp,
     latencyMs: trafficResult.latencyMs,
+    leakDetected,
     error: trafficResult.error,
   };
 }

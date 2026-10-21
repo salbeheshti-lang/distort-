@@ -1424,3 +1424,69 @@ Stage Summary:
 - Latest release remains v1.0.36 — NO new version published.
 - Ready for the user's final go-ahead to release v1.0.37 with the failover fix.
 - HONEST LIMITATION (same as user noted): CI green ≠ real-world Iran connectivity. Only a real Quick Connect attempt on the target network proves the configs work. The in-app xray verification (startVpnEngine + 7s wait + vpnState.connected check) is the final authority.
+
+---
+Task ID: VERIFY-TUNNEL-FIX
+Agent: Verify-Tunnel-Fixer
+Task: Fix critical verifyTunnelTraffic bug — fetch ignored HTTP_PROXY env, so verification always succeeded even when tunnel was broken
+
+Work Log:
+- Read prior context (worklog entries FREE-ENGINE-V1.0.36 + PR1-MERGE-FOLLOWUP). Reviewed desktop/src/main.ts: verifyTunnelTraffic (lines 413-483), fetchRealIp (489-506), startVpnEngine (508-670), stopVpnEngine (672-700), tryQuickConnectTier (1605-1641), handleTunnelVerify (1980-2040).
+- Confirmed the bug: Node's built-in fetch() (undici) silently IGNORES HTTP_PROXY/HTTPS_PROXY env vars. The previous verifyTunnelTraffic set those env vars then called fetch() — which made a DIRECT (non-proxied) request to cloudflare, returning the user's REAL public IP. So `verified` was always true as long as the user had internet, even with a completely broken xray tunnel.
+- Decision: extract verifyTunnelTraffic into a new Electron-free module (src/tunnel-verifier.ts) so it can be unit-tested with bun:test. Refactor main.ts to import from it.
+- Installed dependencies: `cd desktop && bun install && bun add https-proxy-agent && bun add -d @types/bun`. https-proxy-agent@9.1.0 and @types/bun@1.4.3 added.
+- Task 1 — Created desktop/src/tunnel-verifier.ts (383 lines):
+  * Exports TUNNEL_HTTP_PROXY_URL = "http://127.0.0.1:10809", TRACE_URL, TRACE_TIMEOUT_MS=10_000, REAL_IP_TIMEOUT_MS=8_000.
+  * Exports VerifyTunnelResult type with new leakDetected: boolean + realIp: string | null fields.
+  * Pure helpers: parseCloudflareTrace(text) + detectLeak(exitIp, realIp) — both unit-tested in isolation.
+  * Injectable fetchers (ProxyFetcher + RealIpFetcher types) — tests pass mocks, production passes nothing.
+  * defaultProxyFetcher uses node-fetch v3 + https-proxy-agent's HttpsProxyAgent to FORCE the request through xray's HTTP proxy inbound. Uses dynamic import() for both ESM-only modules (node-fetch v3 + https-proxy-agent v9 are ESM-only; the desktop project compiles to CommonJS, so top-level `import` would throw ERR_REQUIRE_ESM at runtime). Modules cached via _depsPromise singleton.
+  * defaultRealIpFetcher uses Node's built-in https.get (no proxy agent) — fetches the user's real IP directly.
+  * verifyTunnelTraffic() runs proxy + real-IP fetches in parallel, parses cloudflare trace, compares exit IP to real IP via detectLeak(). Returns { verified, exitIp, exitCountry, latencyMs, leakDetected, realIp, error? }. `verified` is forced false when leakDetected=true.
+  * Conservatively: when realIp fetch fails (captive portal / no direct internet), leakDetected stays false and verified stays true (the proxy fetch itself succeeded; we can't prove a leak).
+- Created desktop/src/types/https-proxy-agent.d.ts (34 lines): type shim declaring the public surface of https-proxy-agent v9. Needed because the package ships types only via `exports` field in package.json, which our moduleResolution="node" tsconfig does NOT consult (switching to moduleResolution="node16" would force module="node16" + ESM output, breaking the CommonJS build).
+- Task 2 — Leak detection implemented inside verifyTunnelTraffic() (tunnel-verifier.ts:340-358): `const leakDetected = detectLeak(exitIp, realIp); const verified = !leakDetected;`. When leak detected, returns verified=false with error="Leak detected: exit IP ({exitIp}) matches real IP". Also surfaced in handleTunnelVerify (main.ts:1957-1988) via leakDetected field on the API response — defence-in-depth (verifier's own check + wrapper's redundant check).
+- Task 1 (main.ts side) — Replaced inline verifyTunnelTraffic + fetchRealIp + VerifyTunnelResult type in main.ts with imports from ./tunnel-verifier (main.ts:388-395). Removed ~100 lines of buggy code (the old env-var-based fetch). Updated handleTunnelVerify to use trafficResult.realIp + leakDetected directly instead of doing a parallel fetchRealIp() call.
+- Task 3 — Fixed timing bug in tryQuickConnectTier (main.ts:1553): changed `setTimeout(resolve, 7000)` → `setTimeout(resolve, 20000)`. The old 7s wait was shorter than startVpnEngine's internal setTimeout(5000) + 10s verify timeout, so quick-connect checked vpnState.connected BEFORE verification had even started — every config falsely reported "not connected" and quick-connect fell through to the next tier.
+- Task 4 — Fixed stopVpnEngine (main.ts:607-615): after `vpnProcess.kill("SIGKILL")`, added `await new Promise(r => setTimeout(r, 500)); log.info("xray ports released (10808/10809 free)");`. Without this extra 500ms wait, the next startVpnEngine could spawn xray before the OS released the TCP listening sockets on 10808/10809, causing EADDRINUSE + a silent failure to bind the proxy inbound.
+- Task 5 — Added 4 diagnostic log lines to startVpnEngine (visible in %APPDATA%\DISTORT\logs\main.log):
+  * main.ts:455 — `log.info(\`[startVpnEngine] xray process spawned, PID=${vpnProcess.pid}\`)` — right after spawn()
+  * main.ts:460 — `log.info("[startVpnEngine] waiting 5s before verification...")` — right before setTimeout(5000)
+  * main.ts:514 — `log.info(\`[startVpnEngine] starting HTTP verification through proxy ${getTunnelProxyUrl()}...\`)` — first line inside verifyHttpThroughProxy
+  * main.ts:516 — `log.info(\`[startVpnEngine] verification result: verified=${result.verified} exitIp=${result.exitIp} realIp=${result.realIp} leak=${result.leakDetected}\`)` — after verifyTunnelTraffic returns
+- Task 7 — Created desktop/src/__tests__/verify-tunnel.test.ts (257 lines, 16 tests):
+  * Pure-function tests (7): parseCloudflareTrace extracts ip+loc / returns nulls on empty + on missing ip= / detectLeak matches / differs / null-safe / whitespace+case normalisation.
+  * Integration tests (9): verifyTunnelTraffic returns verified=true when exit IP ≠ real IP / verified=false when they match (LEAK) / verified=false when proxy fetch throws / verified=false on non-2xx HTTP / verified=false on invalid trace body / verified=true when realIp fetch fails (can't prove leak) / proxy fetcher called with cloudflare URL / constants are the expected URLs / latencyMs is non-negative on all outcomes.
+  * Tests use the injectable proxyFetcher + realIpFetcher options — NO real network calls. Each test runs in <1ms.
+  * All 16 tests pass with `bun test src/__tests__/verify-tunnel.test.ts`: 16 pass, 0 fail, 55 expect() calls, 45ms total.
+- Task 6 — Verified:
+  * `cd /home/z/my-project && bun run lint`: 0 errors, 1 pre-existing warning (admin/page.tsx:53 unused eslint-disable — untouched, was there before). PASS.
+  * `cd /home/z/my-project/desktop && bunx tsc --noEmit`: 0 errors. PASS. (No pre-existing process.resourcesPath / electron errors this run — possibly the @types/bun install + type shim cleaned up resolution. Either way: 0 new errors, 0 errors total.)
+- Did NOT bump desktop/package.json version (per project convention — orchestrator handles release bump after verifying the fix).
+- Did NOT publish a release or push tags.
+
+Stage Summary:
+- Critical false-positive bug FIXED: verifyTunnelTraffic now uses node-fetch + https-proxy-agent to FORCE the request through xray's HTTP proxy inbound at 127.0.0.1:10809. The previous implementation set process.env.HTTP_PROXY and called Node's built-in fetch() (undici), which silently ignores HTTP_PROXY — so verification always returned the user's real IP and reported "connected" even with a completely broken tunnel.
+- Leak detection ADDED: verifyTunnelTraffic now ALSO fetches the device's real IP directly and compares it to the tunnel exit IP. If they match (xray is bypassing itself), verified is forced to false with leakDetected=true. The API response from /api/tunnel/verify now includes leakDetected.
+- Timing bug FIXED: tryQuickConnectTier's wait bumped from 7s to 20s so startVpnEngine's internal setTimeout(5000) + 10s verify timeout actually has time to complete before quick-connect checks vpnState.connected.
+- Port-release race FIXED: stopVpnEngine now waits 500ms after SIGKILL so xray's TCP listening sockets on 10808/10809 are fully released before the next startVpnEngine spawns xray (was causing EADDRINUSE on rapid reconnect).
+- Diagnostic logging ADDED: 4 new log lines in main.ts so the user can paste %APPDATA%\DISTORT\logs\main.log to diagnose connection failures — PID, 5s wait start, proxy URL, and full verification result (verified/exitIp/realIp/leak).
+- Artifacts produced (committed to working tree):
+  - desktop/src/tunnel-verifier.ts (383 lines, NEW — proxy-aware verifier with leak detection, no electron dependency)
+  - desktop/src/types/https-proxy-agent.d.ts (34 lines, NEW — type shim for moduleResolution=node compat)
+  - desktop/src/__tests__/verify-tunnel.test.ts (257 lines, NEW — 16 unit tests, 55 assertions)
+  - desktop/src/main.ts (3018 lines, MODIFIED — 4 diagnostic log lines + 7s→20s wait + 500ms port-release wait + replaced inline verifyTunnelTraffic/fetchRealIp with imports from tunnel-verifier + handleTunnelVerify updated to surface leakDetected)
+  - desktop/package.json (MODIFIED — added https-proxy-agent@^9.1.0 to deps + @types/bun@^1.4.3 to devDeps)
+  - desktop/bun.lock (regenerated by `bun add https-proxy-agent && bun add -d @types/bun`)
+- Honest limitations:
+  - The dynamic import() of node-fetch + https-proxy-agent adds ~30ms latency to the FIRST verifyTunnelTraffic call (the modules are loaded lazily on first use). Subsequent calls reuse the cached _depsPromise. This is acceptable — verification runs 5s after xray spawn (well after the user clicked connect), so the 30ms is invisible.
+  - node-fetch v3 + https-proxy-agent v9 are ESM-only. If a future Electron upgrade changes the main-process module system (e.g. ESM-only), the dynamic import() approach still works — no changes needed. But if the project ever switches to a bundler (webpack/esbuild) that handles ESM imports in CommonJS output natively, the dynamic import() can be replaced with a static `import` (cleaner code, slightly faster startup).
+  - The type shim (src/types/https-proxy-agent.d.ts) declares the minimal public surface (HttpsProxyAgent class + HttpsProxyAgentOptions interface). If the package adds new options in a future version that we want to use, the shim needs updating. Mitigation: HttpsProxyAgentOptions uses an index signature `[key: string]: unknown` so any option can still be PASSED at runtime — it just won't be type-checked.
+  - The verifyTunnelTraffic real-IP fetch (defaultRealIpFetcher) uses Node's built-in https.get directly to cloudflare. This is a DIRECT (non-proxied) request. If the user's network is heavily censored and cloudflare.com is blocked directly, realIp will be null — verifyTunnelTraffic then can't prove a leak and returns verified=true (assuming the proxy fetch itself succeeded). This is the conservative choice (avoids false negatives) but means a leak could theoretically go undetected if both the proxy and direct fetches return different IPs from different cloudflare endpoints — extremely unlikely but theoretically possible.
+  - The unit tests cover the verifier's pure logic + injectable fetcher paths. They do NOT cover the defaultProxyFetcher's actual integration with node-fetch + https-proxy-agent (would require a real xray instance + real network). That integration is exercised manually by the user clicking "Quick Connect" in the desktop app.
+  - The 20s wait in tryQuickConnectTier is a pragmatic fix — a cleaner refactor would be to make startVpnEngine await verification instead of using setTimeout(5000). But that's a bigger change (would block the IPC handler for the full 5s + 10s = 15s, and would require restructuring the handshakeConfirmed flag). The 20s wait is the safer fix for v1.0.37.
+- Next actions for the orchestrator:
+  1. Review the diff — especially desktop/src/tunnel-verifier.ts (new file) and the 4 diagnostic log lines in desktop/src/main.ts.
+  2. Run `bun run lint` + `cd desktop && bunx tsc --noEmit` + `cd desktop && bun test src/__tests__/verify-tunnel.test.ts` on your end to confirm 0 errors + 16/16 tests pass.
+  3. Optionally: spin up the desktop app + click Quick Connect on a real network to verify the new log lines appear in %APPDATA%\DISTORT\logs\main.log as expected.
+  4. Bump desktop/package.json to 1.0.37 + tag + build.

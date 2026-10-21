@@ -1,6 +1,6 @@
 {
   "name": "distort-desktop",
-  "version": "1.0.36",
+  "version": "1.0.37",
   "description": "DISTORT — Freedom Beyond Borders. A 100% free, anti-censorship VPN stronger than Nekoray & Hiddify.",
   "main": "dist/main.js",
   "author": "DISTORT Project",
@@ -121,13 +121,15 @@
     "electron-log": "^5.2.0",
     "electron-store": "^8.2.0",
     "electron-updater": "^6.8.9",
+    "https-proxy-agent": "^9.1.0",
     "node-fetch": "^3.3.2",
     "sql.js": "^1.15.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "@types/node": "^22.0.0",
     "electron": "^33.0.0",
     "electron-builder": "^25.1.8",
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.6.0"
   }
 }
