@@ -11,8 +11,6 @@ on:
         default: 'debug'
         type: choice
         options: ['debug', 'release']
-permissions:
-  contents: write  # Required for uploading APKs to GitHub Releases
 
 # ─── Secrets required for signed release builds ──────────────────────────────
 # Set these in the repo's Settings → Secrets and variables → Actions:
