@@ -128,13 +128,21 @@ function createBlockingProber() {
         probeCalledCallbacks.delete(port);
         for (const cb of called) Promise.resolve().then(() => cb());
       }
-      return new Promise<boolean>((resolve) => {
-        resolvers.set(port, (result: boolean) => {
+      return new Promise<boolean>((resolve, reject) => {
+        const onResolve = (result: boolean) => {
           probeResults.set(port, result);
           // Notify settled listeners
           Promise.resolve().then(() => notifySettled(port));
           resolve(result);
-        });
+        };
+        const onReject = (err: any) => {
+          // Even on rejection, track that this port was probed so
+          // onProbeChainComplete doesn't hang forever.
+          probeResults.set(port, false);
+          Promise.resolve().then(() => notifySettled(port));
+          reject(err);
+        };
+        resolvers.set(port, onResolve);
         // If a result was pre-set, resolve immediately.
         if (results.has(port)) {
           const r = results.get(port)!;
@@ -387,11 +395,12 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     mock.emitExit(0);
 
     // Wait for the chain-complete signal. If dedup works, this NEVER resolves.
-    // We use a real 2s timeout to detect a hang (NOT for assertion timing —
+    // We use a real 100ms timeout to detect a hang (NOT for assertion timing —
     // only to prevent the test from hanging forever if dedup is broken).
+    // 100ms is sufficient because dedup is synchronous (stuckClearedFired flag)
     const secondChainResult = await Promise.race([
       secondChain.then(() => "resolved"),
-      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 2000)),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 100)),
     ]);
 
     // If secondChain resolved, dedup FAILED — a second probe chain ran.
