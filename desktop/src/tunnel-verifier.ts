@@ -109,9 +109,14 @@ export function parseCloudflareTrace(text: string): {
 
 // ---------------------------------------------------------------------------
 // Leak detection — if the exit IP equals the real IP, traffic is NOT going
-// through the tunnel. We treat null/unknown real IP as "not a leak" because
-// we can't prove a leak happened (the direct fetch may have failed for
-// unrelated reasons — captive portal, no internet, etc.).
+// through the tunnel.
+//
+// IMPORTANT: when realIp is null (couldn't be fetched), we return false here
+// — meaning "we can't PROVE a leak" — BUT callers MUST NOT treat this as
+// "verified". The absence of proof of a leak is NOT proof of no leak. The
+// `verifyTunnelTraffic` function below enforces this by returning
+// `verified: false` when realIp is null AND we couldn't fetch the real IP,
+// even if the proxy fetch itself succeeded.
 // ---------------------------------------------------------------------------
 
 export function detectLeak(
@@ -252,6 +257,16 @@ export const defaultRealIpFetcher: RealIpFetcher = () =>
 //   2. Fetching the device's REAL public IP directly (no proxy).
 //   3. Comparing the two — if they match, the tunnel is leaking (verified=false).
 //
+// STRICT VERIFICATION RULES (v1.0.38 — addresses user review):
+//   - If the proxy fetch fails → verified=false
+//   - If the proxy responds but the body has no valid `ip=` field → verified=false
+//   - If the real-IP fetch fails (realIp===null) → verified=false
+//     Reason: we can't prove the tunnel is routing traffic without comparing
+//     IPs. "No proof of leak" is NOT "proof of no leak".
+//   - If exitIp === realIp → verified=false + leakDetected=true
+//   - ONLY when proxy fetch succeeded AND exitIp is valid AND realIp is valid
+//     AND exitIp !== realIp → verified=true
+//
 // Both fetches run in parallel — they're independent.
 //
 // Tests can inject `proxyFetcher` and `realIpFetcher` to avoid touching the
@@ -289,7 +304,7 @@ export async function verifyTunnelTraffic(opts?: {
         latencyMs,
         leakDetected: false,
         realIp,
-        error: e?.message || String(e) || "Proxy fetch failed",
+        error: `Proxy fetch failed: ${e?.message || String(e) || "unknown"}`,
       };
     }
 
@@ -302,7 +317,7 @@ export async function verifyTunnelTraffic(opts?: {
         latencyMs,
         leakDetected: false,
         realIp,
-        error: `HTTP ${resp.status} through proxy`,
+        error: `Proxy responded with HTTP ${resp.status}`,
       };
     }
 
@@ -332,18 +347,38 @@ export async function verifyTunnelTraffic(opts?: {
         latencyMs,
         leakDetected: false,
         realIp,
-        error: "Proxy responded but no valid trace data",
+        error: "Proxy responded but body has no valid `ip=` field — not a cloudflare trace",
       };
     }
 
     // We have an exit IP. Now check for leaks by comparing with the real IP.
+    //
+    // CRITICAL (v1.0.38): if realIp is null, we CANNOT verify the tunnel.
+    // The previous implementation would return verified=true in this case
+    // (because detectLeak returns false when either IP is null), which is a
+    // false positive — we can't prove the tunnel is routing traffic without
+    // comparing both IPs. Be honest: mark verified=false with a clear error.
+    if (!realIp) {
+      return {
+        verified: false,
+        exitIp,
+        exitCountry,
+        latencyMs,
+        leakDetected: false,
+        realIp: null,
+        error:
+          "Real IP fetch failed — cannot verify tunnel without comparing exit IP against real IP. " +
+          "The tunnel may or may not be routing traffic, but we cannot prove it.",
+      };
+    }
+
     const leakDetected = detectLeak(exitIp, realIp);
 
-    // `verified` requires BOTH a successful proxy fetch AND no leak.
-    // If we couldn't fetch the real IP, we can't prove a leak — we still
-    // mark verified=true because the proxy fetch itself succeeded.
-    // (handleTunnelVerify in main.ts already does this comparison externally
-    // as a defence-in-depth check, so this is consistent.)
+    // `verified` requires ALL of:
+    //   - proxy fetch succeeded (we're past the checks above)
+    //   - exitIp is valid (checked above)
+    //   - realIp is valid (checked above)
+    //   - no leak detected
     const verified = !leakDetected;
 
     return {
@@ -354,7 +389,7 @@ export async function verifyTunnelTraffic(opts?: {
       leakDetected,
       realIp,
       error: leakDetected
-        ? `Leak detected: exit IP (${exitIp}) matches real IP`
+        ? `Leak detected: exit IP (${exitIp}) matches real IP (${realIp}) — tunnel is NOT routing traffic`
         : undefined,
     };
   } catch (e: any) {
@@ -365,7 +400,7 @@ export async function verifyTunnelTraffic(opts?: {
       latencyMs: Date.now() - startTime,
       leakDetected: false,
       realIp: null,
-      error: e?.message || String(e),
+      error: `Unexpected error during verification: ${e?.message || String(e)}`,
     };
   }
 }
