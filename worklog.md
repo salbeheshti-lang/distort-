@@ -1392,3 +1392,35 @@ Stage Summary:
   3. Commit + push to main. The free-engine.yml workflow will run on push (because of the `paths:` filter on .github/workflows/free-engine.yml + scripts/free-engine.ts) and produce the first batch of best.txt / all.txt / status.json in ~37 seconds.
   4. After verifying the workflow completes successfully, tag v1.0.36 + run build-windows.yml to produce the installer.
   5. Do NOT publish the release until you've manually verified the desktop app can fetch https://raw.githubusercontent.com/salbeheshti-lang/distort-/main/public/free-engine/best.txt and that quickConnect picks up the new failover chain (logs should show "[1/5] trying free-engine best.txt").
+
+---
+Task ID: PR1-MERGE-FOLLOWUP
+Agent: main (orchestrator)
+Task: Review + merge PR #1 (Quick Connect tiered failover fix) + verify CI
+
+Work Log:
+- Fetched PR #1 from salbeheshti-lang/distort- (branch: fix/quick-connect-tier-failover, 3 commits, 2 files changed)
+- Reviewed the diff in detail:
+  - desktop/src/main.ts: rewrote quickConnect() with new tryQuickConnectTier() helper that:
+    * Returns true ONLY when xray actually verifies a tunnel (not just when list is empty)
+    * Uses shared attemptedUris Set<string> to dedupe configs across tiers (best.txt ∩ all.txt)
+    * For last-working-config.json fallback, uses a FRESH Set so the previously-working config CAN be retried even if it appeared in a failed list
+    * Writes cached-configs.json ONLY after a config is verified working
+  - .github/workflows/build-android.yml: removed duplicate `permissions: contents: write` key (was defined twice)
+- Confirmed PR CI: test-configs on cf536036 → success
+- Merged PR via squash: commit fcbfd1e9 on main
+- Triggered tests.yml + build-windows.yml via workflow_dispatch on the new sha (GitHub didn't auto-trigger because the squash merge commit didn't match path filters)
+- Verified CI on fcbfd1e9:
+  - test-configs: ✅ success
+  - build-windows (first run): ✅ success
+  - Build debug APK: ✅ success
+  - Build & publish signed release APK: skipped (no signing secrets — expected)
+- Local lint: 0 errors, 1 pre-existing warning
+- NO new release/tag created (per user request — they want to review before final release)
+
+Stage Summary:
+- PR #1 merged cleanly. The user's exact concern is addressed: "advance to the next source after all configs in the current source fail, not only when its list is empty" — tryQuickConnectTier returns false only after exhausting ALL configs in the tier, then quickConnect proceeds to the next tier.
+- All CI green on the merged commit.
+- Latest release remains v1.0.36 — NO new version published.
+- Ready for the user's final go-ahead to release v1.0.37 with the failover fix.
+- HONEST LIMITATION (same as user noted): CI green ≠ real-world Iran connectivity. Only a real Quick Connect attempt on the target network proves the configs work. The in-app xray verification (startVpnEngine + 7s wait + vpnState.connected check) is the final authority.
