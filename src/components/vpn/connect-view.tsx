@@ -43,6 +43,11 @@ import {
 import { postJSON, postJSONSoft, useFetch } from "@/hooks/use-fetch";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
 import { toast } from "sonner";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { IpLocationWidget } from "./ip-location-widget";
@@ -75,9 +80,19 @@ type ImportedConfig = {
 
 // Latency probe state keyed by config id.
 //   - testing: true while a probe is in-flight for this id
-//   - ok: true if the host:port is reachable
-//   - ms: round-trip in milliseconds (null when untested or unreachable)
-type LatencyState = { ms: number | null; ok: boolean; testing: boolean };
+//   - ok:     true if the host is reachable in some form (TLS or TCP only)
+//   - reach:  3-state granularity for the badge color
+//             "ok"   = TLS handshake succeeded (GREEN — truly reachable)
+//             "tcp"  = TCP ok, TLS failed (ORANGE — may work via Reality)
+//             "fail" = TCP connect failed (ORANGE — xray might still work)
+//             "unknown" = no probe yet (GRAY — untested)
+//   - ms:     round-trip in milliseconds (null when untested or unreachable)
+type LatencyState = {
+  ms: number | null;
+  ok: boolean;
+  testing: boolean;
+  reach: "ok" | "tcp" | "fail" | "unknown";
+};
 
 // Reachability check API response shape (mirrors /api/imported-configs/check).
 type CheckResult = {
@@ -85,11 +100,15 @@ type CheckResult = {
   host: string;
   port: number;
   ok: boolean;
+  reach: "ok" | "tcp" | "fail";
   latencyMs: number;
+  method: "tcp" | "tls" | "fail";
 };
 type CheckResponse = {
   checked: number;
   ok: number;
+  tls: number;
+  tcpOnly: number;
   results: CheckResult[];
 };
 
@@ -157,33 +176,30 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
   const isConnecting = state === "connecting" || connecting;
 
   // ---- Sorted configs ----
-  // Sort order (lower score = earlier in list):
-  //   1. Personal configs that are reachable, by latency asc
-  //   2. Default configs that are reachable, by latency asc
-  //   3. Untested personal configs
-  //   4. Untested default configs
-  //   5. Personal configs that are currently being tested
-  //   6. Default configs that are currently being tested
-  //   7. Unreachable (personal first, then default)
+  // Sort order (per the SUBIMPORT-PING-FIX spec):
+  //   1. Personal configs first (favorite=true OR subscription.kind="manual")
+  //   2. Within each tier (personal/default), sort:
+  //      a. Reachable configs (reach="ok"|"tcp" with a latency) by ms ascending
+  //      b. Untested + failed configs MIXED IN by score desc
+  //         (failed configs aren't pushed to the bottom — they might still
+  //          work via xray Reality, so they stay visible alongside untested ones)
   const sortedConfigs = useMemo(() => {
     const list = configData?.configs ?? [];
     const score = (c: ImportedConfig): number => {
       const lat = latencies[c.id];
       const personalBoost = isPersonal(c) ? 0 : 1_000_000;
       if (lat?.testing) {
-        // testing → very low priority, but above unreachable
-        return personalBoost + 5_000_000;
+        // testing → mid-low priority so the list doesn't reorder wildly mid-probe
+        return personalBoost + 8_000_000;
       }
       if (lat?.ok && lat.ms != null) {
-        // reachable — sort by ms ascending; offset by 0 so reachable always wins
+        // reachable (TLS or TCP) — sort by ms ascending
         return personalBoost + lat.ms;
       }
-      if (lat?.ok === false) {
-        // unreachable — lowest priority
-        return personalBoost + 10_000_000;
-      }
-      // untested (no probe yet) — above unreachable, below reachable
-      return personalBoost + 2_000_000;
+      // Both "fail" (TCP failed) and "unknown" (untested) configs sort by
+      // score desc here. Mixing them in keeps failed configs visible instead
+      // of pushing them all to the bottom of the list.
+      return personalBoost + 4_000_000 - c.score;
     };
     return [...list].sort((a, b) => score(a) - score(b));
   }, [configData, latencies]);
@@ -197,29 +213,39 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     if (!sortedConfigs.length) return;
     const reachable = sortedConfigs.find((c) => {
       const lat = latencies[c.id];
-      return lat?.ok && lat.ms != null;
+      // Prefer "ok" (TLS reachable) — orange configs (tcp/fail) may work
+      // but aren't a guaranteed-good default.
+      return lat?.reach === "ok" && lat.ms != null;
     });
     setSelectedConfig(reachable || sortedConfigs[0]);
   }, [sortedConfigs, latencies, userSelectedId, selectedConfig]);
 
   // Auto-switch to the best reachable config after Test all completes —
-  // only if the user hasn't manually picked one.
+  // only if the user hasn't manually picked one. Prefers "ok" (TLS) over
+  // "tcp" (TLS-failed but TCP ok).
   useEffect(() => {
     if (userSelectedId) return;
     if (testingAll) return;
-    const reachable = sortedConfigs.find((c) => {
+    const tlsOk = sortedConfigs.find((c) => {
+      const lat = latencies[c.id];
+      return lat?.reach === "ok" && lat.ms != null;
+    });
+    const anyReachable = tlsOk || sortedConfigs.find((c) => {
       const lat = latencies[c.id];
       return lat?.ok && lat.ms != null;
     });
-    if (reachable && reachable.id !== selectedConfig?.id) {
-      setSelectedConfig(reachable);
+    if (anyReachable && anyReachable.id !== selectedConfig?.id) {
+      setSelectedConfig(anyReachable);
     }
   }, [testingAll, sortedConfigs, latencies, userSelectedId, selectedConfig]);
 
   // ---- Test all configs (calls /api/imported-configs/check) ----
-  // Single API call → server probes ALL optimized configs in parallel
-  // (Promise.all in /api/imported-configs/check/route.ts). Returns a results
-  // array with {id, host, port, ok, latencyMs} per config.
+  // Single API call → server probes ALL configs (not just optimized) in
+  // parallel via Promise.all. Returns a results array with {id, host, port,
+  // ok, reach, latencyMs, method} per config. The new endpoint uses
+  // probeReachabilityTLS which does TCP connect + TLS handshake, returning
+  // a 3-state reach value: "ok" (TLS ok), "tcp" (TCP ok, TLS failed),
+  // "fail" (TCP failed).
   const testAllConfigs = useCallback(async () => {
     const list = configData?.configs ?? [];
     if (!list.length) {
@@ -233,7 +259,7 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     setLatencies((prev) => {
       const next = { ...prev };
       for (const c of list) {
-        next[c.id] = { ms: null, ok: false, testing: true };
+        next[c.id] = { ms: null, ok: false, testing: true, reach: "unknown" };
       }
       return next;
     });
@@ -241,7 +267,7 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     try {
       const r = await postJSONSoft<CheckResponse>(
         "/api/imported-configs/check",
-        { limit: 50 }
+        { limit: 80 }
       );
       if (!r.ok || !r.data) {
         toast.error("Test failed", {
@@ -252,7 +278,12 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           const next = { ...prev };
           for (const c of list) {
             if (next[c.id]?.testing) {
-              next[c.id] = { ms: null, ok: false, testing: false };
+              next[c.id] = {
+                ms: null,
+                ok: false,
+                testing: false,
+                reach: "unknown",
+              };
             }
           }
           return next;
@@ -270,24 +301,35 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
               ms: found.latencyMs,
               ok: found.ok,
               testing: false,
+              reach: found.reach,
             };
           } else {
-            // Config wasn't probed (e.g. bucket != optimized) — fall back to
-            // the server-side reach value from the GET /api/imported-configs
+            // Config wasn't probed (e.g. beyond the limit) — fall back to the
+            // server-side reach value from the GET /api/imported-configs
             // response so the badge is still accurate.
+            const reachVal =
+              c.reach === "ok"
+                ? "ok"
+                : c.reach === "tcp"
+                ? "tcp"
+                : c.reach === "fail"
+                ? "fail"
+                : "unknown";
             next[c.id] = {
               ms: c.latencyMs || null,
-              ok: c.reach === "ok",
+              ok: reachVal === "ok" || reachVal === "tcp",
               testing: false,
+              reach: reachVal,
             };
           }
         }
         return next;
       });
       const okCount = r.data.ok;
+      const tlsCount = r.data.tls;
       const total = r.data.checked;
       toast.success("Reachability test done", {
-        description: `${okCount}/${total} reachable${
+        description: `${okCount}/${total} reachable · ${tlsCount} via TLS${
           okCount > 0 ? " · best latency auto-selected" : ""
         }`,
       });
@@ -491,27 +533,40 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {/* Test all — probes all optimized configs in parallel server-side */}
-          <button
-            onClick={testAllConfigs}
-            disabled={testingAll || configsLoading || totalConfigs === 0}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#10d9a0]/40 transition-colors text-xs text-muted-foreground hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
-            title="Probe all configs in parallel and auto-select the fastest reachable one"
-          >
-            {testingAll ? (
-              <>
-                <RefreshCw className="w-3 h-3 animate-spin text-[#10d9a0]" />
-                <span className="text-[#10d9a0] font-tech">
-                  Testing{testingCount ? ` ${testingCount}` : "…"}
-                </span>
-              </>
-            ) : (
-              <>
-                <Activity className="w-3 h-3 text-[#10d9a0]" />
-                <span className="font-tech">Test all</span>
-              </>
-            )}
-          </button>
+          {/* Test all — probes ALL configs (TCP + TLS handshake) in parallel server-side */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                onClick={testAllConfigs}
+                disabled={testingAll || configsLoading || totalConfigs === 0}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#10d9a0]/40 transition-colors text-xs text-muted-foreground hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {testingAll ? (
+                  <>
+                    <RefreshCw className="w-3 h-3 animate-spin text-[#10d9a0]" />
+                    <span className="text-[#10d9a0] font-tech">
+                      Testing{testingCount ? ` ${testingCount}` : "…"}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Activity className="w-3 h-3 text-[#10d9a0]" />
+                    <span className="font-tech">Test all</span>
+                  </>
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent
+              side="bottom"
+              className="max-w-[280px] bg-[#0d1426] border border-[#00f0ff]/20 text-[#c8d8ff] text-[11px] font-sans normal-case tracking-normal shadow-[0_0_18px_rgba(0,240,255,0.15)]"
+            >
+              <span>
+                Probes TCP+TLS reachability.{" "}
+                <span className="text-[#ffb020]">Orange ?</span> means the host
+                may be DPI-blocked but could still work via xray Reality.
+              </span>
+            </TooltipContent>
+          </Tooltip>
 
           {/* Version + update button */}
           <button
@@ -637,26 +692,52 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
                       return (
                         <span className="text-muted-foreground">testing…</span>
                       );
-                    if (lat?.ok && lat.ms != null)
+                    // GREEN — TLS reachable
+                    if (lat?.reach === "ok" && lat.ms != null)
                       return (
                         <span style={{ color: pingColor(lat.ms) }}>
                           {lat.ms}ms
                         </span>
                       );
-                    if (lat?.ok === false)
+                    // ORANGE — TCP ok, TLS failed
+                    if (lat?.reach === "tcp" && lat.ms != null)
                       return (
-                        <span className="text-[#ff4d6d]">unreachable</span>
+                        <span className="text-[#ffb020]">
+                          {lat.ms}ms? · maybe blocked
+                        </span>
                       );
+                    // ORANGE — TCP failed (xray might still work)
+                    if (lat?.reach === "fail")
+                      return (
+                        <span className="text-[#ffb020]">
+                          ? · try via xray
+                        </span>
+                      );
+                    // Fall back to server-side reach if no client probe exists
                     if (
                       selectedConfig.reach === "ok" &&
                       selectedConfig.latencyMs > 0
                     )
                       return (
                         <span
-                          style={{ color: pingColor(selectedConfig.latencyMs) }}
+                          style={{
+                            color: pingColor(selectedConfig.latencyMs),
+                          }}
                         >
                           {selectedConfig.latencyMs}ms
                         </span>
+                      );
+                    if (selectedConfig.reach === "tcp")
+                      return (
+                        <span className="text-[#ffb020]">
+                          {selectedConfig.latencyMs > 0
+                            ? `${selectedConfig.latencyMs}ms?`
+                            : "? · maybe blocked"}
+                        </span>
+                      );
+                    if (selectedConfig.reach === "fail")
+                      return (
+                        <span className="text-[#ffb020]">? · try via xray</span>
                       );
                     return (
                       <span className="text-muted-foreground/60">untested</span>
@@ -909,13 +990,20 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
   );
 }
 
-// Latency badge — color-coded by latency with 5 visible states:
+// Latency badge — color-coded by reach state with 4 visible states:
 //   - testing: gray spinner + "…"
-//   - reachable & ≤60ms: green badge with ms
-//   - reachable & 61-150ms: yellow badge with ms
-//   - reachable & >150ms: red badge with ms
-//   - unreachable: red "✗" badge
-//   - untested: gray "—" badge (or falls back to server-side reach value)
+//   - reach="ok" (TLS reachable): GREEN badge with ms (color varies by ms)
+//   - reach="tcp" (TCP ok, TLS failed): ORANGE badge with "ms?" — may work via Reality
+//   - reach="fail" (TCP failed): ORANGE badge with "?" — xray might still work
+//   - untested: gray "—" badge (no probe has run)
+//
+// Design decision: we DON'T show a hard red ✗ for "fail" anymore. Iran DPI
+// injects RST packets on bare TCP connects, so a "fail" config can still work
+// through xray Reality/WS-TLS transport. Orange ? communicates "host may be
+// blocked but worth trying" instead of "definitely dead". A real failure only
+// surfaces when the user actually clicks Connect and the tunnel fails to
+// verify (we'd need to track that separately — for now, all probe-state
+// results are advisory).
 function LatencyBadge({
   state,
   fallbackMs,
@@ -925,6 +1013,7 @@ function LatencyBadge({
   fallbackMs: number;
   fallbackReach: string;
 }) {
+  // Testing state — gray spinner, no result yet.
   if (state?.testing) {
     return (
       <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground">
@@ -932,54 +1021,78 @@ function LatencyBadge({
       </span>
     );
   }
-  if (state?.ok && state.ms != null) {
+
+  // Compute the effective reach — prefer client-side probe, fall back to
+  // server-side reach value (initial DB state) when no probe has run yet.
+  const reach: "ok" | "tcp" | "fail" | "unknown" =
+    state?.reach ??
+    (fallbackReach === "ok"
+      ? "ok"
+      : fallbackReach === "tcp"
+      ? "tcp"
+      : fallbackReach === "fail"
+      ? "fail"
+      : "unknown");
+  const ms = state?.ms ?? (fallbackMs > 0 ? fallbackMs : null);
+
+  // GREEN — TLS handshake succeeded (truly reachable through DPI).
+  if (reach === "ok" && ms != null) {
     const color =
-      state.ms <= 60 ? "#10d9a0" : state.ms <= 150 ? "#ffb020" : "#ff4d6d";
+      ms <= 60 ? "#10d9a0" : ms <= 150 ? "#ffb020" : "#ff4d6d";
     const bg =
-      state.ms <= 60
+      ms <= 60
         ? "rgba(16,217,160,0.1)"
-        : state.ms <= 150
+        : ms <= 150
         ? "rgba(255,176,32,0.1)"
         : "rgba(255,77,109,0.1)";
     const border =
-      state.ms <= 60
+      ms <= 60
         ? "rgba(16,217,160,0.3)"
-        : state.ms <= 150
+        : ms <= 150
         ? "rgba(255,176,32,0.3)"
         : "rgba(255,77,109,0.3)";
     return (
       <span
         className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border"
         style={{ color, background: bg, borderColor: border }}
+        title="TLS reachable — host is truly online through DPI"
       >
-        {state.ms}ms
+        {ms}ms
       </span>
     );
   }
-  if (state?.ok === false) {
+
+  // ORANGE — TCP ok, TLS failed. May work via Reality (looks like normal HTTPS).
+  if (reach === "tcp" && ms != null) {
     return (
-      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ff4d6d]/30 text-[#ff4d6d] bg-[#ff4d6d]/5">
-        ✗
+      <span
+        className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ffb020]/30 text-[#ffb020] bg-[#ffb020]/5"
+        title="TCP ok, TLS handshake failed — DPI may be interfering. May still work via Reality."
+      >
+        {ms}ms?
       </span>
     );
   }
-  // Untested — fall back to server-side reach if available
-  if (fallbackReach === "ok" && fallbackMs > 0) {
+
+  // ORANGE — TCP failed. xray might still get through (Reality mimics legit
+  // TLS, so DPI might not block the actual tunnel even though our probe failed).
+  if (reach === "fail") {
     return (
-      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground">
-        {fallbackMs}ms
+      <span
+        className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ffb020]/30 text-[#ffb020] bg-[#ffb020]/5"
+        title="TCP probe failed — but xray might still connect via Reality/WS. Try connecting to see if it actually works."
+      >
+        ?
       </span>
     );
   }
-  if (fallbackReach === "fail") {
-    return (
-      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ff4d6d]/30 text-[#ff4d6d] bg-[#ff4d6d]/5">
-        ✗
-      </span>
-    );
-  }
+
+  // GRAY — no probe data yet. Show "—".
   return (
-    <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground/60">
+    <span
+      className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground/60"
+      title="Untested — click Test all to probe this config"
+    >
       —
     </span>
   );
