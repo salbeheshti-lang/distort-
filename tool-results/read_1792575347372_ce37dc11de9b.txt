@@ -1,0 +1,536 @@
+     1→"use client";
+     2→
+     3→import { useMemo, useState } from "react";
+     4→import { motion } from "framer-motion";
+     5→import {
+     6→  Search, Shield, Crown, Zap, X, Check, Wifi, RefreshCw, Plus, Link2, Trash2, Star,
+     7→  Copy, Download, Filter, AlertCircle, Globe2, Activity, Server as ServerIcon, Clock,
+     8→} from "lucide-react";
+     9→import { useFetch, postJSON } from "@/hooks/use-fetch";
+    10→import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+    11→import { Input } from "@/components/ui/input";
+    12→import { Badge } from "@/components/ui/badge";
+    13→import { Button } from "@/components/ui/button";
+    14→import { Textarea } from "@/components/ui/textarea";
+    15→import { Label } from "@/components/ui/label";
+    16→import {
+    17→  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter,
+    18→} from "@/components/ui/dialog";
+    19→import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+    20→import { toast } from "sonner";
+    21→import { putJSON } from "@/hooks/use-fetch";
+    22→
+    23→type ImportedConfig = {
+    24→  id: string;
+    25→  protocol: string;
+    26→  uri: string;
+    27→  label: string | null;
+    28→  host: string;
+    29→  port: number;
+    30→  network: string;
+    31→  security: string;
+    32→  sni: string | null;
+    33→  path: string | null;
+    34→  flow: string | null;
+    35→  country: string | null;
+    36→  score: number;
+    37→  flags: string;
+    38→  reach: string;
+    39→  latencyMs: number;
+    40→  bucket: string;
+    41→  favorite: boolean;
+    42→  checkedAt: string | null;
+    43→  subscription: { label: string; kind: string } | null;
+    44→};
+    45→
+    46→type Subscription = {
+    47→  id: string;
+    48→  label: string;
+    49→  url: string;
+    50→  kind: string;
+    51→  enabled: boolean;
+    52→  intervalMin: number;
+    53→  lastFetchedAt: string | null;
+    54→  lastCount: number;
+    55→  lastError: string | null;
+    56→  _count?: { configs: number };
+    57→};
+    58→
+    59→function flagFor(country?: string | null): string {
+    60→  if (!country) return "🌐";
+    61→  const map: Record<string, string> = {
+    62→    Iran: "🇮🇷", Germany: "🇩🇪", Netherlands: "🇳🇱", France: "🇫🇷", Finland: "🇫🇮",
+    63→    "United States": "🇺🇸", "United Kingdom": "🇬🇧", Japan: "🇯🇵", Singapore: "🇸🇬",
+    64→    Turkey: "🇹🇷", UAE: "🇦🇪", Georgia: "🇬🇪", Armenia: "🇦🇲",
+    65→  };
+    66→  return map[country] || "🌐";
+    67→}
+    68→
+    69→function reachColor(reach: string): string {
+    70→  if (reach === "ok") return "#10d9a0";
+    71→  if (reach === "fail") return "#ff4d6d";
+    72→  return "#8aa0c4";
+    73→}
+    74→
+    75→function scoreColor(score: number): string {
+    76→  if (score >= 80) return "#10d9a0";
+    77→  if (score >= 60) return "#00f0ff";
+    78→  if (score >= 40) return "#ffb020";
+    79→  return "#8aa0c4";
+    80→}
+    81→
+    82→export function CommunityMeshView() {
+    83→  const [tab, setTab] = useState<"optimized" | "all" | "favorites">("optimized");
+    84→  const [query, setQuery] = useState("");
+    85→  const [proto, setProto] = useState<string>("all");
+    86→  const [showImport, setShowImport] = useState(false);
+    87→  const [showAddSub, setShowAddSub] = useState(false);
+    88→  const [refreshing, setRefreshing] = useState<string | null>(null);
+    89→  const [checking, setChecking] = useState(false);
+    90→
+    91→  const subsState = useFetch<{ subscriptions: Subscription[] }>("/api/subscriptions");
+    92→  const configsState = useFetch<{ configs: ImportedConfig[]; count: number }>(
+    93→    `/api/imported-configs?bucket=${tab === "all" ? "" : tab === "favorites" ? "" : "optimized"}&favorite=${tab === "favorites" ? "1" : ""}&q=${encodeURIComponent(query)}&protocol=${proto === "all" ? "" : proto}&limit=200`
+    94→  );
+    95→
+    96→  const subscriptions = subsState.data?.subscriptions ?? [];
+    97→  const configs = configsState.data?.configs ?? [];
+    98→  const totalImported = configsState.data?.count ?? 0;
+    99→
+   100→  const refreshSub = async (id: string, label: string) => {
+   101→    setRefreshing(id);
+   102→    try {
+   103→      const r = await postJSON<{ count: number; fetchedAt?: string; error?: string }>(`/api/subscriptions/${id}/refresh`, {});
+   104→      if (r.error) throw new Error(r.error);
+   105→      toast.success("Subscription refreshed", { description: `${label}: ${r.count} configs parsed` });
+   106→      subsState.refetch();
+   107→      configsState.refetch();
+   108→    } catch (e) {
+   109→      toast.error("Refresh failed", { description: (e as Error).message });
+   110→    } finally {
+   111→      setRefreshing(null);
+   112→    }
+   113→  };
+   114→
+   115→  const runCheck = async () => {
+   116→    setChecking(true);
+   117→    try {
+   118→      const r = await postJSON<{ checked: number; ok: number }>("/api/imported-configs/check", { limit: 30 });
+   119→      toast.success("Reachability check done", { description: `${r.ok}/${r.checked} endpoints reachable` });
+   120→      configsState.refetch();
+   121→    } catch (e) {
+   122→      toast.error("Check failed", { description: (e as Error).message });
+   123→    } finally {
+   124→      setChecking(false);
+   125→    }
+   126→  };
+   127→
+   128→  const toggleFav = async (c: ImportedConfig) => {
+   129→    try {
+   130→      await putJSON(`/api/imported-configs/${c.id}`, { favorite: !c.favorite });
+   131→      configsState.refetch();
+   132→    } catch {
+   133→      toast.error("Could not update favorite");
+   134→    }
+   135→  };
+   136→
+   137→  const copyUri = (c: ImportedConfig) => {
+   138→    navigator.clipboard.writeText(c.uri);
+   139→    toast.success("Config URI copied", { description: `${c.protocol} ${c.host}:${c.port}` });
+   140→  };
+   141→
+   142→  const downloadSub = () => {
+   143→    const blob = new Blob([configs.map((c) => c.uri).join("\n")], { type: "text/plain" });
+   144→    const url = URL.createObjectURL(blob);
+   145→    const a = document.createElement("a");
+   146→    a.href = url;
+   147→    a.download = "distort-community-mesh.txt";
+   148→    a.click();
+   149→    URL.revokeObjectURL(url);
+   150→    toast.success("Subscription exported");
+   151→  };
+   152→
+   153→  const removeConfig = async (c: ImportedConfig) => {
+   154→    try {
+   155→      await fetch(`/api/imported-configs/${c.id}`, { method: "DELETE" });
+   156→      toast.success("Config removed");
+   157→      configsState.refetch();
+   158→      subsState.refetch();
+   159→    } catch {
+   160→      toast.error("Could not remove config");
+   161→    }
+   162→  };
+   163→
+   164→  return (
+   165→    <div className="space-y-4">
+   166→      {/* Header / stats */}
+   167→      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+   168→        <KpiCard icon={<ServerIcon className="w-4 h-4" />} label="Subscriptions" value={String(subscriptions.length)} color="#00f0ff" />
+   169→        <KpiCard icon={<Globe2 className="w-4 h-4" />} label="Total Configs" value={String(totalImported)} color="#8b5cf6" />
+   170→        <KpiCard icon={<Shield className="w-4 h-4" />} label="Optimized" value={String(configs.filter((c) => c.bucket === "optimized").length)} color="#10d9a0" />
+   171→        <KpiCard icon={<Star className="w-4 h-4" />} label="Favorites" value={String(configs.filter((c) => c.favorite).length)} color="#ffb020" />
+   172→      </div>
+   173→
+   174→      {/* Subscriptions panel */}
+   175→      <Card className="glass border-white/5">
+   176→        <CardHeader className="pb-3">
+   177→          <div className="flex items-center justify-between">
+   178→            <CardTitle className="font-display tracking-wider text-sm flex items-center gap-2">
+   179→              <Link2 className="w-4 h-4 text-[#00f0ff]" /> Subscription Sources
+   180→            </CardTitle>
+   181→            <Button size="sm" onClick={() => setShowAddSub(true)} className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider h-8">
+   182→              <Plus className="w-3.5 h-3.5 mr-1" /> Add URL
+   183→            </Button>
+   184→          </div>
+   185→        </CardHeader>
+   186→        <CardContent className="space-y-2">
+   187→          {subsState.loading ? (
+   188→            <div className="text-xs text-muted-foreground font-tech uppercase tracking-wider">Loading subscriptions…</div>
+   189→          ) : subscriptions.length === 0 ? (
+   190→            <div className="text-sm text-muted-foreground py-2">
+   191→              No subscriptions yet. Add the Iran config-collector URL or paste your own configs.
+   192→            </div>
+   193→          ) : (
+   194→            subscriptions.map((s) => (
+   195→              <div key={s.id} className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+   196→                <div className="flex items-start gap-3">
+   197→                  <div className={`w-9 h-9 rounded-lg flex items-center justify-center border ${s.kind === "community" ? "bg-[#00f0ff]/10 border-[#00f0ff]/30 text-[#5cf2ff]" : "bg-[#8b5cf6]/10 border-[#8b5cf6]/30 text-[#a78bfa]"}`}>
+   198→                    {s.kind === "community" ? <Globe2 className="w-4 h-4" /> : <Link2 className="w-4 h-4" />}
+   199→                  </div>
+   200→                  <div className="flex-1 min-w-0">
+   201→                    <div className="flex items-center gap-2 flex-wrap">
+   202→                      <span className="font-semibold text-white text-sm truncate">{s.label}</span>
+   203→                      <Badge variant="outline" className={`text-[9px] font-tech uppercase tracking-wider h-4 ${s.kind === "community" ? "border-[#00f0ff]/30 text-[#5cf2ff]" : "border-[#8b5cf6]/30 text-[#a78bfa]"}`}>
+   204→                        {s.kind}
+   205→                      </Badge>
+   206→                      <Badge variant="outline" className="text-[9px] font-tech uppercase tracking-wider h-4 border-white/10 text-muted-foreground">
+   207→                        {s._count?.configs ?? s.lastCount} configs
+   208→                      </Badge>
+   209→                      {s.lastError && (
+   210→                        <Badge variant="outline" className="text-[9px] font-tech uppercase tracking-wider h-4 border-[#ff4d6d]/30 text-[#ff4d6d]">
+   211→                          <AlertCircle className="w-2.5 h-2.5 mr-0.5" />error
+   212→                        </Badge>
+   213→                      )}
+   214→                    </div>
+   215→                    <div className="text-[11px] text-muted-foreground truncate font-mono mt-0.5">{s.url}</div>
+   216→                    {s.lastFetchedAt && (
+   217→                      <div className="text-[10px] text-muted-foreground/70 mt-0.5 flex items-center gap-1">
+   218→                        <Clock className="w-2.5 h-2.5" />
+   219→                        Last: {new Date(s.lastFetchedAt).toLocaleString()}
+   220→                      </div>
+   221→                    )}
+   222→                  </div>
+   223→                  <Button
+   224→                    size="sm"
+   225→                    variant="outline"
+   226→                    onClick={() => refreshSub(s.id, s.label)}
+   227→                    disabled={refreshing === s.id || !s.enabled}
+   228→                    className="h-8 border-[#00f0ff]/30 text-[#5cf2ff] hover:bg-[#00f0ff]/10 font-tech uppercase tracking-wider text-[10px]"
+   229→                  >
+   230→                    <RefreshCw className={`w-3 h-3 mr-1 ${refreshing === s.id ? "animate-spin" : ""}`} />
+   231→                    {s.intervalMin > 0 ? `Auto ${s.intervalMin}m` : "Refresh"}
+   232→                  </Button>
+   233→                </div>
+   234→              </div>
+   235→            ))
+   236→          )}
+   237→        </CardContent>
+   238→      </Card>
+   239→
+   240→      {/* Toolbar */}
+   241→      <Card className="glass border-white/5">
+   242→        <CardContent className="p-4">
+   243→          <div className="flex flex-col md:flex-row gap-3">
+   244→            <div className="relative flex-1">
+   245→              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+   246→              <Input
+   247→                value={query}
+   248→                onChange={(e) => setQuery(e.target.value)}
+   249→                placeholder="Search by host, country, label…"
+   250→                className="pl-10 bg-white/[0.03] border-white/10 focus-visible:border-[#00f0ff]/50"
+   251→              />
+   252→            </div>
+   253→            <div className="flex gap-2">
+   254→              <select
+   255→                value={proto}
+   256→                onChange={(e) => setProto(e.target.value)}
+   257→                className="h-9 rounded-md bg-white/[0.04] border border-white/10 px-3 text-sm focus:outline-none focus:border-[#00f0ff]/50"
+   258→              >
+   259→                <option value="all">All protocols</option>
+   260→                <option value="vless">VLESS</option>
+   261→                <option value="vmess">VMess</option>
+   262→                <option value="trojan">Trojan</option>
+   263→                <option value="ss">Shadowsocks</option>
+   264→              </select>
+   265→              <Button variant="outline" onClick={runCheck} disabled={checking} className="border-[#10d9a0]/30 text-[#10d9a0] hover:bg-[#10d9a0]/10 font-tech uppercase tracking-wider text-xs h-9">
+   266→                <Activity className={`w-3.5 h-3.5 mr-1.5 ${checking ? "animate-spin" : ""}`} />
+   267→                {checking ? "Checking…" : "Test reach"}
+   268→              </Button>
+   269→              <Button variant="outline" onClick={downloadSub} className="border-white/10 text-muted-foreground hover:text-white font-tech uppercase tracking-wider text-xs h-9">
+   270→                <Download className="w-3.5 h-3.5 mr-1.5" /> Export
+   271→              </Button>
+   272→              <Button onClick={() => setShowImport(true)} className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider text-xs h-9">
+   273→                <Plus className="w-3.5 h-3.5 mr-1.5" /> Import
+   274→              </Button>
+   275→            </div>
+   276→          </div>
+   277→
+   278→          {/* Tabs */}
+   279→          <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className="mt-3">
+   280→            <TabsList className="bg-white/[0.03] border border-white/5 h-9">
+   281→              <TabsTrigger value="optimized" className="data-[state=active]:bg-[#00f0ff]/10 data-[state=active]:text-[#5cf2ff] font-tech uppercase tracking-wider text-xs">
+   282→                <Shield className="w-3 h-3 mr-1" /> Optimized
+   283→              </TabsTrigger>
+   284→              <TabsTrigger value="all" className="data-[state=active]:bg-[#00f0ff]/10 data-[state=active]:text-[#5cf2ff] font-tech uppercase tracking-wider text-xs">
+   285→                <Filter className="w-3 h-3 mr-1" /> All
+   286→              </TabsTrigger>
+   287→              <TabsTrigger value="favorites" className="data-[state=active]:bg-[#00f0ff]/10 data-[state=active]:text-[#5cf2ff] font-tech uppercase tracking-wider text-xs">
+   288→                <Star className="w-3 h-3 mr-1" /> Favorites
+   289→              </TabsTrigger>
+   290→            </TabsList>
+   291→          </Tabs>
+   292→        </CardContent>
+   293→      </Card>
+   294→
+   295→      {/* Config list */}
+   296→      <Card className="glass border-white/5">
+   297→        <CardHeader className="pb-2">
+   298→          <div className="flex items-center justify-between">
+   299→            <CardTitle className="font-display tracking-wider text-sm flex items-center gap-2">
+   300→              <ServerIcon className="w-4 h-4 text-[#8b5cf6]" /> Distort Config
+   301→              <span className="text-xs text-muted-foreground font-tech">· {configs.length} configs</span>
+   302→            </CardTitle>
+   303→            <span className="text-[10px] text-muted-foreground font-tech uppercase tracking-wider">
+   304→              Sorted by score ↓
+   305→            </span>
+   306→          </div>
+   307→        </CardHeader>
+   308→        <CardContent>
+   309→          {configsState.loading ? (
+   310→            <div className="space-y-2">
+   311→              {Array.from({ length: 6 }).map((_, i) => (
+   312→                <div key={i} className="rounded-xl border border-white/5 bg-white/[0.02] p-3 animate-pulse h-14" />
+   313→              ))}
+   314→            </div>
+   315→          ) : configs.length === 0 ? (
+   316→            <div className="text-center py-12">
+   317→              <Globe2 className="w-10 h-10 text-muted-foreground/50 mx-auto mb-3" />
+   318→              <p className="text-sm text-muted-foreground">No configs in this view yet.</p>
+   319→              <p className="text-xs text-muted-foreground/70 mt-1">Import a config or refresh a subscription to populate the mesh.</p>
+   320→            </div>
+   321→          ) : (
+   322→            <div className="max-h-[560px] overflow-y-auto pr-1 -mr-1 space-y-2">
+   323→              {configs.map((c, i) => {
+   324→                const flags = c.flags ? c.flags.split(",").filter(Boolean) : [];
+   325→                return (
+   326→                  <motion.div
+   327→                    key={c.id}
+   328→                    initial={{ opacity: 0, y: 6 }}
+   329→                    animate={{ opacity: 1, y: 0 }}
+   330→                    transition={{ delay: Math.min(i * 0.01, 0.3) }}
+   331→                    className="rounded-xl border border-white/5 bg-white/[0.02] hover:border-[#00f0ff]/20 hover:bg-white/[0.04] transition-colors p-3"
+   332→                  >
+   333→                    <div className="flex items-center gap-3">
+   334→                      <span className="text-xl">{flagFor(c.country)}</span>
+   335→                      <div className="flex-1 min-w-0">
+   336→                        <div className="flex items-center gap-2 flex-wrap">
+   337→                          <span className="font-semibold text-white text-sm truncate">{c.label || `${c.host}:${c.port}`}</span>
+   338→                          <Badge variant="outline" className="text-[9px] font-tech uppercase tracking-wider h-4 border-[#8b5cf6]/30 text-[#a78bfa]">
+   339→                            {c.protocol}
+   340→                          </Badge>
+   341→                          {flags.map((f) => (
+   342→                            <Badge key={f} variant="outline" className="text-[9px] font-tech uppercase tracking-wider h-4 border-[#00f0ff]/30 text-[#5cf2ff]">
+   343→                              {f}
+   344→                            </Badge>
+   345→                          ))}
+   346→                        </div>
+   347→                        <div className="text-[11px] text-muted-foreground font-mono truncate mt-0.5">
+   348→                          {c.host}:{c.port} · {c.network}/{c.security}
+   349→                          {c.sni && <span className="text-muted-foreground/70"> · sni={c.sni}</span>}
+   350→                        </div>
+   351→                      </div>
+   352→                      <div className="flex items-center gap-3">
+   353→                        {/* Score */}
+   354→                        <div className="text-center">
+   355→                          <div className="font-mono text-sm font-bold" style={{ color: scoreColor(c.score) }}>{c.score}</div>
+   356→                          <div className="text-[9px] text-muted-foreground font-tech uppercase tracking-wider">score</div>
+   357→                        </div>
+   358→                        {/* Reach */}
+   359→                        <div className="text-center">
+   360→                          <div className="font-mono text-sm font-bold" style={{ color: reachColor(c.reach) }}>
+   361→                            {c.reach === "ok" ? `${c.latencyMs}ms` : c.reach === "fail" ? "✗" : "—"}
+   362→                          </div>
+   363→                          <div className="text-[9px] text-muted-foreground font-tech uppercase tracking-wider">reach</div>
+   364→                        </div>
+   365→                      </div>
+   366→                      <div className="flex items-center gap-1">
+   367→                        <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-[#ffb020]" onClick={() => toggleFav(c)}>
+   368→                          <Star className={`w-3.5 h-3.5 ${c.favorite ? "fill-[#ffb020] text-[#ffb020]" : ""}`} />
+   369→                        </Button>
+   370→                        <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-[#5cf2ff]" onClick={() => copyUri(c)}>
+   371→                          <Copy className="w-3.5 h-3.5" />
+   372→                        </Button>
+   373→                        <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-[#ff4d6d]" onClick={() => removeConfig(c)}>
+   374→                          <Trash2 className="w-3.5 h-3.5" />
+   375→                        </Button>
+   376→                      </div>
+   377→                    </div>
+   378→                  </motion.div>
+   379→                );
+   380→              })}
+   381→            </div>
+   382→          )}
+   383→        </CardContent>
+   384→      </Card>
+   385→
+   386→      {/* Import dialog */}
+   387→      <ImportDialog open={showImport} onOpenChange={setShowImport} onDone={() => { configsState.refetch(); subsState.refetch(); }} />
+   388→      <AddSubDialog open={showAddSub} onOpenChange={setShowAddSub} onDone={() => { subsState.refetch(); configsState.refetch(); }} />
+   389→    </div>
+   390→  );
+   391→}
+   392→
+   393→function KpiCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: string; color: string }) {
+   394→  return (
+   395→    <Card className="glass border-white/5 relative overflow-hidden">
+   396→      <div className="absolute inset-0 opacity-25" style={{ background: `radial-gradient(circle at top right, ${color}, transparent 70%)` }} />
+   397→      <CardContent className="p-4 relative">
+   398→        <div className="flex items-center gap-2 mb-2">
+   399→          <span style={{ color }}>{icon}</span>
+   400→          <span className="text-[10px] uppercase tracking-wider text-muted-foreground font-tech">{label}</span>
+   401→        </div>
+   402→        <div className="font-display text-2xl font-bold text-white">{value}</div>
+   403→      </CardContent>
+   404→    </Card>
+   405→  );
+   406→}
+   407→
+   408→function ImportDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenChange: (o: boolean) => void; onDone: () => void }) {
+   409→  const [raw, setRaw] = useState("");
+   410→  const [source, setSource] = useState("personal");
+   411→  const [busy, setBusy] = useState(false);
+   412→
+   413→  const handleImport = async () => {
+   414→    if (!raw.trim()) return;
+   415→    setBusy(true);
+   416→    try {
+   417→      const r = await postJSON<{ count: number; config?: unknown }>("/api/imported-configs/import", { raw, source });
+   418→      toast.success("Configs imported", { description: `${r.count} parsed & saved.` });
+   419→      setRaw("");
+   420→      onOpenChange(false);
+   421→      onDone();
+   422→    } catch (e) {
+   423→      toast.error("Import failed", { description: (e as Error).message });
+   424→    } finally {
+   425→      setBusy(false);
+   426→    }
+   427→  };
+   428→
+   429→  return (
+   430→    <Dialog open={open} onOpenChange={onOpenChange}>
+   431→      <DialogContent className="glass-strong border-[#00f0ff]/20 max-w-2xl">
+   432→        <DialogHeader>
+   433→          <DialogTitle className="font-display tracking-wider text-white flex items-center gap-2">
+   434→            <Plus className="w-4 h-4 text-[#00f0ff]" /> Import Personal Configs
+   435→          </DialogTitle>
+   436→          <DialogDescription className="text-muted-foreground">
+   437→            Paste one or more <code className="text-[#5cf2ff]">vmess://</code>, <code className="text-[#5cf2ff]">vless://</code>, <code className="text-[#5cf2ff]">trojan://</code> or <code className="text-[#5cf2ff]">ss://</code> URIs (one per line). They will be parsed, scored, and added to your Distort Config.
+   438→          </DialogDescription>
+   439→        </DialogHeader>
+   440→        <div className="space-y-3">
+   441→          <div className="space-y-1.5">
+   442→            <Label className="text-xs font-tech uppercase tracking-wider text-muted-foreground">Source label</Label>
+   443→            <Input value={source} onChange={(e) => setSource(e.target.value)} className="bg-white/[0.04] border-white/10" placeholder="personal" />
+   444→          </div>
+   445→          <div className="space-y-1.5">
+   446→            <Label className="text-xs font-tech uppercase tracking-wider text-muted-foreground">Config URIs</Label>
+   447→            <Textarea
+   448→              value={raw}
+   449→              onChange={(e) => setRaw(e.target.value)}
+   450→              placeholder={"vless://uuid@host:443?security=reality&sni=...#my-server\nvmess://eyJhZGQ...\ntrojan://pass@host:443#my-trojan"}
+   451→              className="bg-white/[0.04] border-white/10 font-mono text-xs min-h-[180px] resize-y"
+   452→            />
+   453→          </div>
+   454→          <p className="text-[11px] text-muted-foreground/70">
+   455→            Single URIs are auto-favorited. Bulk pastes are deduplicated by host:port. Optimized configs (TLS/Reality/WS/gRPC) are highlighted.
+   456→          </p>
+   457→        </div>
+   458→        <DialogFooter>
+   459→          <Button variant="ghost" onClick={() => onOpenChange(false)} className="text-muted-foreground hover:text-white">Cancel</Button>
+   460→          <Button onClick={handleImport} disabled={busy || !raw.trim()} className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider">
+   461→            {busy ? <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : <Check className="w-3.5 h-3.5 mr-1.5" />}
+   462→            {busy ? "Importing…" : "Import"}
+   463→          </Button>
+   464→        </DialogFooter>
+   465→      </DialogContent>
+   466→    </Dialog>
+   467→  );
+   468→}
+   469→
+   470→function AddSubDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenChange: (o: boolean) => void; onDone: () => void }) {
+   471→  const [url, setUrl] = useState("");
+   472→  const [label, setLabel] = useState("");
+   473→  const [interval, setInterval] = useState(60);
+   474→  const [busy, setBusy] = useState(false);
+   475→
+   476→  const handleAdd = async () => {
+   477→    if (!url.trim()) return;
+   478→    setBusy(true);
+   479→    try {
+   480→      const r = await postJSON<{ subscription: Subscription; warning?: string }>("/api/subscriptions", {
+   481→        url, label: label || undefined, kind: "custom", intervalMin: interval, fetchNow: true,
+   482→      });
+   483→      if (r.warning) {
+   484→        toast.warning("Subscription added (fetch warning)", { description: r.warning });
+   485→      } else {
+   486→        toast.success("Subscription added", { description: `${r.subscription.label}: ${r.subscription.lastCount} configs` });
+   487→      }
+   488→      setUrl(""); setLabel("");
+   489→      onOpenChange(false);
+   490→      onDone();
+   491→    } catch (e) {
+   492→      toast.error("Could not add subscription", { description: (e as Error).message });
+   493→    } finally {
+   494→      setBusy(false);
+   495→    }
+   496→  };
+   497→
+   498→  return (
+   499→    <Dialog open={open} onOpenChange={onOpenChange}>
+   500→      <DialogContent className="glass-strong border-[#00f0ff]/20 max-w-lg">
+   501→        <DialogHeader>
+   502→          <DialogTitle className="font-display tracking-wider text-white flex items-center gap-2">
+   503→            <Link2 className="w-4 h-4 text-[#00f0ff]" /> Add Subscription URL
+   504→          </DialogTitle>
+   505→          <DialogDescription className="text-muted-foreground">
+   506→            Distort will fetch the URL, parse all <code className="text-[#5cf2ff]">vmess://</code> / <code className="text-[#5cf2ff]">vless://</code> / <code className="text-[#5cf2ff]">trojan://</code> / <code className="text-[#5cf2ff]">ss://</code> URIs, and auto-refresh on your schedule.
+   507→          </DialogDescription>
+   508→        </DialogHeader>
+   509→        <div className="space-y-3">
+   510→          <div className="space-y-1.5">
+   511→            <Label className="text-xs font-tech uppercase tracking-wider text-muted-foreground">Subscription URL</Label>
+   512→            <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/sub.txt" className="bg-white/[0.04] border-white/10 font-mono text-xs" />
+   513→          </div>
+   514→          <div className="grid grid-cols-2 gap-3">
+   515→            <div className="space-y-1.5">
+   516→              <Label className="text-xs font-tech uppercase tracking-wider text-muted-foreground">Label</Label>
+   517→              <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="My subscription" className="bg-white/[0.04] border-white/10" />
+   518→            </div>
+   519→            <div className="space-y-1.5">
+   520→              <Label className="text-xs font-tech uppercase tracking-wider text-muted-foreground">Auto-refresh (min)</Label>
+   521→              <Input type="number" value={interval} onChange={(e) => setInterval(Number(e.target.value))} className="bg-white/[0.04] border-white/10" />
+   522→            </div>
+   523→          </div>
+   524→        </div>
+   525→        <DialogFooter>
+   526→          <Button variant="ghost" onClick={() => onOpenChange(false)} className="text-muted-foreground hover:text-white">Cancel</Button>
+   527→          <Button onClick={handleAdd} disabled={busy || !url.trim()} className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider">
+   528→            {busy ? <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" /> : <Plus className="w-3.5 h-3.5 mr-1.5" />}
+   529→            {busy ? "Adding…" : "Add & Fetch"}
+   530→          </Button>
+   531→        </DialogFooter>
+   532→      </DialogContent>
+   533→    </Dialog>
+   534→  );
+   535→}
+   536→
