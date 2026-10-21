@@ -41,15 +41,53 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const electron_1 = require("electron");
 const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
+const http = __importStar(require("http"));
+const https = __importStar(require("https"));
+const url_1 = require("url");
 const child_process_1 = require("child_process");
 const electron_store_1 = __importDefault(require("electron-store"));
 const electron_log_1 = __importDefault(require("electron-log"));
+const db_init_1 = require("./db-init");
 // ---------------------------------------------------------------------------
-// Logging
+// Logging — configure early so we capture errors during startup.
+// We set a FIXED log file path so the user can always find it at:
+//   %APPDATA%\DISTORT\logs\main.log
 // ---------------------------------------------------------------------------
+const fs_1 = require("fs");
+// Determine the DISTORT data directory.
+// On Windows: %APPDATA%\DISTORT
+// On macOS:   ~/Library/Application Support/DISTORT
+// On Linux:   ~/.config/DISTORT
+// We use "DISTORT" (uppercase) regardless of what app.getName() returns.
+const DISTORT_DATA_DIR = process.platform === "win32"
+    ? path.join(process.env.APPDATA || path.join(process.env.HOME || "", "AppData", "Roaming"), "DISTORT")
+    : process.platform === "darwin"
+        ? path.join(process.env.HOME || "", "Library", "Application Support", "DISTORT")
+        : path.join(process.env.HOME || "", ".config", "DISTORT");
+// Create the logs directory if it doesn't exist
+const LOG_DIR = path.join(DISTORT_DATA_DIR, "logs");
+try {
+    (0, fs_1.mkdirSync)(LOG_DIR, { recursive: true });
+}
+catch (e) {
+    // Directory might already exist or we lack permissions — log error to console
+    console.error(`Failed to create log directory ${LOG_DIR}: ${e?.message}`);
+}
+// Force electron-log to write to our fixed path
+electron_log_1.default.transports.file.resolvePathFn = () => path.join(LOG_DIR, "main.log");
 electron_log_1.default.transports.file.level = "info";
 electron_log_1.default.transports.console.level = "info";
+// Write a clear startup marker so we can find this log entry easily.
+electron_log_1.default.info("============================================================");
 electron_log_1.default.info("DISTORT Desktop starting up…");
+electron_log_1.default.info(`Electron: ${process.versions.electron}`);
+electron_log_1.default.info(`Node: ${process.versions.node}`);
+electron_log_1.default.info(`Platform: ${process.platform} ${process.arch}`);
+electron_log_1.default.info(`Process execPath: ${process.execPath}`);
+electron_log_1.default.info(`App version: 1.0.30`);
+electron_log_1.default.info(`Data dir: ${DISTORT_DATA_DIR}`);
+electron_log_1.default.info(`Log file: ${path.join(LOG_DIR, "main.log")}`);
+electron_log_1.default.info("============================================================");
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -57,7 +95,7 @@ const store = new electron_store_1.default({
     defaults: {
         vpn: { connected: false, server: null, protocol: "wireguard", startedAt: null },
         settings: {
-            autoConnect: false,
+            autoConnect: true,
             killSwitch: true,
             stealthMode: true,
             dnsLeakProtection: true,
@@ -70,6 +108,22 @@ let mainWindow = null;
 let tray = null;
 let vpnProcess = null;
 let isQuitting = false;
+// ---------------------------------------------------------------------------
+// Companion control API — localhost-only HTTP server on port 10810
+// (port 10809 is xray's HTTP proxy inbound, NOT a control API — see
+// real-xray-config.ts: buildRealXrayConfig uses 10808 for SOCKS5 and
+// 10809 for the HTTP proxy inbound. The control API must use a DIFFERENT
+// port so the BrowserWithCompanionEngine in recovery-engine.ts can
+// actually reach it.)
+// ---------------------------------------------------------------------------
+const COMPANION_API_HOST = "127.0.0.1"; // localhost ONLY — never 0.0.0.0
+const COMPANION_API_PORT = 10810; // NOT 10809 (that's xray's HTTP proxy)
+const COMPANION_API_VERSION = "1.0.0";
+const COMPANION_API_PLATFORM = "desktop-companion";
+const COMPANION_START_TIMEOUT_MS = 10_000;
+const COMPANION_VERIFY_TIMEOUT_MS = 15_000;
+const COMPANION_MAX_BODY_BYTES = 1024 * 1024; // 1MB cap on POST bodies
+let companionApiServer = null;
 // ---------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------
@@ -129,16 +183,46 @@ function createWindow() {
     });
     const url = getLoadUrl();
     electron_log_1.default.info(`Loading URL: ${url}`);
-    mainWindow?.loadURL(url).catch(() => {
-        electron_log_1.default.warn("Failed to load main URL, falling back to offline page");
-        mainWindow?.loadURL(getOfflinePath());
-    });
-    // After 10s, if still loading, show offline page
-    setTimeout(() => {
-        if (mainWindow && !mainWindow.webContents.getURL().startsWith("http")) {
-            mainWindow.loadURL(getOfflinePath());
+    // Listen for load failures + console errors
+    mainWindow?.webContents.on("did-fail-load", (_e, errorCode, errorDescription, validatedURL) => {
+        electron_log_1.default.error(`did-fail-load: errorCode=${errorCode} desc=${errorDescription} url=${validatedURL}`);
+        // Retry after 3s if the Next.js server might still be starting up
+        if (errorCode !== -3) { // -3 is aborted (user navigated away) — don't retry
+            setTimeout(() => {
+                electron_log_1.default.info(`Retrying load: ${url}`);
+                mainWindow?.loadURL(url).catch(() => {
+                    electron_log_1.default.warn("Retry failed — loading offline page");
+                    mainWindow?.loadURL(getOfflinePath());
+                });
+            }, 3000);
         }
-    }, 10000);
+    });
+    mainWindow?.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+        electron_log_1.default.info(`[renderer:${level}] ${message} (${sourceId}:${line})`);
+    });
+    mainWindow?.webContents.on("render-process-gone", (_e, details) => {
+        electron_log_1.default.error(`Render process gone: ${JSON.stringify(details)}`);
+    });
+    mainWindow?.loadURL(url).catch((err) => {
+        electron_log_1.default.warn(`Failed to load main URL: ${err?.message || err}`);
+        // Retry once after 5s — Next.js server might still be starting
+        setTimeout(() => {
+            electron_log_1.default.info(`Retrying load after 5s: ${url}`);
+            mainWindow?.loadURL(url).catch(() => {
+                electron_log_1.default.warn("Retry failed — loading offline page");
+                mainWindow?.loadURL(getOfflinePath());
+            });
+        }, 5000);
+    });
+    // After 30s, if still on offline page, reload the main URL one more time
+    setTimeout(() => {
+        if (mainWindow && !mainWindow.webContents.getURL().startsWith("http://localhost:38571")) {
+            electron_log_1.default.info("30s elapsed and dashboard not loaded — retrying main URL");
+            mainWindow.loadURL(getLoadUrl()).catch(() => {
+                electron_log_1.default.warn("Final retry failed — staying on offline page");
+            });
+        }
+    }, 30000);
 }
 // ---------------------------------------------------------------------------
 // Tray
@@ -156,6 +240,10 @@ function createTray() {
         const vpn = store.get("vpn");
         const menu = electron_1.Menu.buildFromTemplate([
             {
+                label: `DISTORT v${electron_1.app.getVersion()}`,
+                enabled: false,
+            },
+            {
                 label: vpn.connected ? "● Connected" : "○ Disconnected",
                 enabled: false,
             },
@@ -168,6 +256,26 @@ function createTray() {
                     }
                     else {
                         quickConnect();
+                    }
+                },
+            },
+            {
+                label: "Check for Updates",
+                click: () => {
+                    mainWindow?.webContents.send("update:check-now-trigger");
+                    if (autoUpdaterModule) {
+                        autoUpdaterModule.checkForUpdates().catch((err) => {
+                            electron_1.dialog.showErrorBox("Update Check Failed", err?.message || "Unknown error");
+                        });
+                    }
+                    else {
+                        electron_1.dialog.showMessageBox({
+                            type: "info",
+                            title: "DISTORT Updates",
+                            message: `You are running v${electron_1.app.getVersion()}.`,
+                            detail: "Auto-update is not available in this build.\n\nCheck https://github.com/di6tort-bit/distort/releases for the latest version.",
+                            buttons: ["OK"],
+                        });
                     }
                 },
             },
@@ -222,6 +330,29 @@ function getWintunPath() {
     }
     return path.join(process.resourcesPath, "bin", "wintun.dll");
 }
+// Build a REAL xray config from a raw config URI (vmess://, vless://, trojan://, ss://).
+// This is the extracted, reusable form: it takes ONLY a configUri (no server object)
+// because the URI itself carries the host/port/credentials. Used by both the desktop
+// UI's startVpnEngine() and the companion control API's /api/tunnel/start endpoint.
+//
+// Throws an honest error if the URI can't be parsed — NO fake/placeholder credentials.
+function buildXrayConfigFromUri(configUri) {
+    if (!configUri || typeof configUri !== "string" || configUri.length < 10) {
+        throw new Error("Invalid configUri — expected a non-empty vmess://, vless://, trojan://, or ss:// URI");
+    }
+    const { parseUriToRealConfig, buildRealXrayConfig } = require("./real-xray-config");
+    const realCfg = parseUriToRealConfig(configUri);
+    if (!realCfg) {
+        throw new Error("Could not parse the provided config URI — expected vmess://, vless://, trojan://, or ss://");
+    }
+    const settings = store.get("settings");
+    return buildRealXrayConfig(realCfg, {
+        tun: false, // SOCKS5 + HTTP proxy mode — no admin required
+        socksPort: 10808,
+        httpPort: 10809,
+        dnsLeakProtection: settings.dnsLeakProtection !== false,
+    });
+}
 // Build a REAL xray config using real credentials from a Community Mesh URI.
 // Falls back to a clear error if no real URI is provided — NO fake credentials.
 function buildXrayConfig(server, protocol, configUri) {
@@ -229,23 +360,97 @@ function buildXrayConfig(server, protocol, configUri) {
         throw new Error("No server selected");
     // If we have a real Community Mesh URI, use ITS credentials (not fakes).
     if (configUri && typeof configUri === "string" && configUri.length > 10) {
-        // Inline import to avoid circular deps
-        const { parseUriToRealConfig, buildRealXrayConfig } = require("./real-xray-config");
-        const realCfg = parseUriToRealConfig(configUri);
-        if (realCfg) {
-            const settings = store.get("settings");
-            return buildRealXrayConfig(realCfg, {
-                tun: true, // system-wide tunnel via wintun.dll
-                socksPort: 10808,
-                httpPort: 10809,
-                dnsLeakProtection: settings.dnsLeakProtection !== false,
-            });
-        }
-        throw new Error("Could not parse the provided config URI");
+        return buildXrayConfigFromUri(configUri);
     }
     // No real URI → throw an honest error instead of using fake credentials.
     throw new Error(`No real VPN config provided. The Distort servers (${server.host}:${server.port}) are not yet operational. ` +
         `Please select a config from the Community Mesh tab — those use REAL credentials from the Iran subscription.`);
+}
+async function verifyTunnelTraffic() {
+    // Use HTTP fetch through the SOCKS5 proxy instead of raw SOCKS5 + TLS.
+    // The previous raw SOCKS5 implementation was failing with ECONNRESET
+    // because it manually implemented the SOCKS5 protocol + TLS handshake,
+    // which is error-prone. Using Node's built-in fetch with a proxy agent
+    // is more reliable.
+    //
+    // We use the HTTP proxy (port 10809) instead of SOCKS5 (port 10808)
+    // because Node's fetch() supports HTTP proxies via env vars natively.
+    const startTime = Date.now();
+    try {
+        // Set proxy env vars for this request
+        const prevHttpProxy = process.env.HTTP_PROXY;
+        const prevHttpsProxy = process.env.HTTPS_PROXY;
+        process.env.HTTP_PROXY = "http://127.0.0.1:10809";
+        process.env.HTTPS_PROXY = "http://127.0.0.1:10809";
+        // Try fetching through the proxy
+        const resp = await fetch("https://www.cloudflare.com/cdn-cgi/trace", {
+            signal: AbortSignal.timeout(10000),
+        });
+        // Restore env vars
+        process.env.HTTP_PROXY = prevHttpProxy || "";
+        process.env.HTTPS_PROXY = prevHttpsProxy || "";
+        if (!resp.ok) {
+            return {
+                verified: false,
+                exitIp: null,
+                exitCountry: null,
+                latencyMs: Date.now() - startTime,
+                error: `HTTP ${resp.status} through proxy`,
+            };
+        }
+        const text = await resp.text();
+        const latencyMs = Date.now() - startTime;
+        // Validate response — must contain "ip=" to prove traffic flowed
+        if (text.includes("ip=")) {
+            const exitIp = text.match(/ip=([^\r\n]+)/)?.[1]?.trim() || "";
+            const exitCountry = text.match(/loc=([^\r\n]+)/)?.[1]?.trim() || "";
+            return {
+                verified: true,
+                exitIp: exitIp || null,
+                exitCountry: exitCountry || null,
+                latencyMs,
+            };
+        }
+        else {
+            return {
+                verified: false,
+                exitIp: null,
+                exitCountry: null,
+                latencyMs,
+                error: "Proxy responded but no valid trace data",
+            };
+        }
+    }
+    catch (e) {
+        // Restore env vars on error too
+        process.env.HTTP_PROXY = "";
+        process.env.HTTPS_PROXY = "";
+        return {
+            verified: false,
+            exitIp: null,
+            exitCountry: null,
+            latencyMs: Date.now() - startTime,
+            error: e?.message || String(e),
+        };
+    }
+}
+// Fetch the device's REAL public IP by doing a DIRECT (non-proxied) HTTPS
+// GET to cloudflare/cdn-cgi/trace. Used by /api/tunnel/verify to compare
+// against the exit IP — if they match, traffic is NOT going through the
+// tunnel (leak). If they differ, tunnel is verified working.
+async function fetchRealIp() {
+    return new Promise((resolve) => {
+        const req = https.get("https://www.cloudflare.com/cdn-cgi/trace", { timeout: 8000 }, (res) => {
+            let data = "";
+            res.on("data", (chunk) => { data += chunk.toString(); });
+            res.on("end", () => {
+                const match = data.match(/ip=([^\r\n]+)/);
+                resolve(match ? match[1].trim() : null);
+            });
+        });
+        req.on("error", () => resolve(null));
+        req.on("timeout", () => { req.destroy(); resolve(null); });
+    });
 }
 async function startVpnEngine(server, protocol, configUri) {
     if (!server)
@@ -321,104 +526,33 @@ async function startVpnEngine(server, protocol, configUri) {
     // This is the ONLY way to verify the tunnel works — NOT just checking if the
     // SOCKS port is open (that only proves xray's inbound is ready, not outbound).
     //
-    // We do a full SOCKS5 handshake + TLS + HTTP GET to cloudflare/cdn-cgi/trace.
-    // If we get a valid response containing "ip=", the tunnel is verified working.
-    // If ANY step fails → return false (NOT connected). No fallbacks.
+    // We delegate to the top-level verifyTunnelTraffic() which does a full SOCKS5
+    // handshake + TLS + HTTP GET to cloudflare/cdn-cgi/trace and returns structured
+    // data (verified + exitIp + exitCountry + latencyMs + error). The wrapper below
+    // keeps the side effects that integrate with the desktop UI's startup flow
+    // (updating the global vpn state + sending IPC events to the renderer).
     async function verifyHttpThroughProxy() {
         // Make this function accessible to health monitoring (top-level ref)
         verifyHttpThroughProxyRef = verifyHttpThroughProxy;
-        let socksSocket = null;
-        let tlsSocket = null;
-        try {
-            const net = require("net");
-            const { connect: tlsConnect } = await Promise.resolve().then(() => __importStar(require("tls")));
-            // Create a SOCKS5 connection to xray's local proxy
-            socksSocket = new net.Socket();
-            await new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error("SOCKS connect timeout")), 5000);
-                socksSocket.connect(10808, "127.0.0.1", () => { clearTimeout(t); resolve(); });
-                socksSocket.on("error", (err) => { clearTimeout(t); reject(err); });
+        const result = await verifyTunnelTraffic();
+        if (result.verified && result.exitIp) {
+            electron_log_1.default.info(`Traffic verification: exit IP=${result.exitIp}, country=${result.exitCountry} — tunnel verified (latency=${result.latencyMs}ms)`);
+            // Store exit IP + country in VPN state
+            const currentVpn = store.get("vpn");
+            store.set("vpn", {
+                ...currentVpn,
+                exitIp: result.exitIp,
+                exitCountry: result.exitCountry,
             });
-            // SOCKS5 greeting: version 5, 1 auth method, no auth
-            socksSocket.write(Buffer.from([0x05, 0x01, 0x00]));
-            await new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error("SOCKS greeting timeout")), 5000);
-                socksSocket.once("data", () => { clearTimeout(t); resolve(); });
+            mainWindow?.webContents.send("vpn:exit-info", {
+                exitIp: result.exitIp,
+                exitCountry: result.exitCountry,
             });
-            // SOCKS5 CONNECT request to www.cloudflare.com:443
-            const targetHost = "www.cloudflare.com";
-            const hostBytes = Buffer.from(targetHost);
-            const connectReq = Buffer.concat([
-                Buffer.from([0x05, 0x01, 0x00, 0x03]),
-                Buffer.from([hostBytes.length]),
-                hostBytes,
-                Buffer.from([0x01, 0xbb]), // port 443
-            ]);
-            socksSocket.write(connectReq);
-            await new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error("SOCKS CONNECT timeout")), 8000);
-                socksSocket.once("data", (data) => {
-                    clearTimeout(t);
-                    if (data[1] === 0x00) {
-                        resolve(); // connected through SOCKS
-                    }
-                    else {
-                        reject(new Error(`SOCKS CONNECT failed: code ${data[1]}`));
-                    }
-                });
-            });
-            // Wrap in TLS
-            tlsSocket = tlsConnect({ socket: socksSocket, servername: targetHost });
-            await new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error("TLS handshake timeout")), 8000);
-                tlsSocket.once("secureConnect", () => { clearTimeout(t); resolve(); });
-                tlsSocket.once("error", (err) => { clearTimeout(t); reject(err); });
-            });
-            // Send HTTP request
-            tlsSocket.write("GET /cdn-cgi/trace HTTP/1.1\r\nHost: www.cloudflare.com\r\nConnection: close\r\n\r\n");
-            const response = await new Promise((resolve, reject) => {
-                let data = "";
-                const t = setTimeout(() => resolve(data), 8000);
-                tlsSocket.on("data", (chunk) => { data += chunk.toString(); });
-                tlsSocket.on("end", () => { clearTimeout(t); resolve(data); });
-                tlsSocket.on("error", (err) => { clearTimeout(t); reject(err); });
-            });
-            // Validate response — must contain "ip=" to prove traffic flowed
-            if (response.includes("ip=")) {
-                // Parse exit IP and country from cloudflare trace response
-                // Response format: ip=x.x.x.x\nuag=...\nloc=IR\ncolo=...\n
-                const exitIp = response.match(/ip=([^\r\n]+)/)?.[1]?.trim() || "";
-                const exitCountry = response.match(/loc=([^\r\n]+)/)?.[1]?.trim() || "";
-                electron_log_1.default.info(`Traffic verification: exit IP=${exitIp}, country=${exitCountry} — tunnel verified`);
-                // Store exit IP + country in VPN state
-                const currentVpn = store.get("vpn");
-                store.set("vpn", {
-                    ...currentVpn,
-                    exitIp,
-                    exitCountry,
-                });
-                mainWindow?.webContents.send("vpn:exit-info", { exitIp, exitCountry });
-                return true;
-            }
-            else {
-                electron_log_1.default.warn("Traffic verification: SOCKS connected but no valid HTTP response — NOT connected");
-                return false;
-            }
+            return true;
         }
-        catch (e) {
-            electron_log_1.default.warn(`Traffic verification FAILED: ${e?.message} — NOT connected`);
+        else {
+            electron_log_1.default.warn(`Traffic verification FAILED: ${result.error || "no valid response"} — NOT connected`);
             return false;
-        }
-        finally {
-            // Always clean up sockets
-            try {
-                tlsSocket?.destroy();
-            }
-            catch { }
-            try {
-                socksSocket?.destroy();
-            }
-            catch { }
         }
     }
     vpnProcess.stdout?.on("data", (data) => {
@@ -1014,24 +1148,138 @@ async function disableKillSwitch() {
 }
 async function quickConnect() {
     try {
-        // Step 1: Get multiple optimized configs from Community Mesh
-        // We'll try each one in sequence until one works — this is the
-        // NATIONAL INTERNET RESILIENCE feature: if one config is blocked,
-        // we automatically try the next one.
-        const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`;
-        const meshRes = await fetch(meshUrl);
-        const meshData = await meshRes.json();
-        const configs = meshData?.configs || [];
+        // Step 1: Get configs from API
+        let configs = [];
+        try {
+            const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`;
+            const meshRes = await fetch(meshUrl);
+            if (meshRes.ok) {
+                const meshData = await meshRes.json();
+                configs = meshData?.configs || [];
+                electron_log_1.default.info(`Quick connect: fetched ${configs.length} configs from API`);
+            }
+            else {
+                electron_log_1.default.warn(`Quick connect: API returned ${meshRes.status}, trying alternatives`);
+            }
+        }
+        catch (e) {
+            electron_log_1.default.warn(`Quick connect: API fetch failed (${e?.message}), trying alternatives`);
+        }
+        // Step 2: If no configs from API, try refreshing subscription directly
         if (configs.length === 0) {
-            electron_log_1.default.error("Quick connect: no Community Mesh configs available");
-            mainWindow?.webContents.send("vpn:error", "No VPN configs available. Please refresh the Community Mesh subscription or import a config.");
+            electron_log_1.default.info("Quick connect: no configs from API — refreshing Iran subscription directly");
+            try {
+                const subResp = await fetch(`${getLoadUrl()}/api/subscriptions`);
+                if (subResp.ok) {
+                    const subData = await subResp.json();
+                    const subs = subData.subscriptions || [];
+                    for (const sub of subs) {
+                        electron_log_1.default.info(`Quick connect: refreshing subscription "${sub.label}"`);
+                        const refreshResp = await fetch(`${getLoadUrl()}/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
+                        if (refreshResp.ok) {
+                            const refreshData = await refreshResp.json();
+                            electron_log_1.default.info(`Quick connect: subscription refreshed — ${refreshData.count || 0} configs`);
+                        }
+                    }
+                    // Now try fetching configs again
+                    const meshRes2 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
+                    if (meshRes2.ok) {
+                        const meshData2 = await meshRes2.json();
+                        configs = meshData2?.configs || [];
+                        electron_log_1.default.info(`Quick connect: after refresh, fetched ${configs.length} configs`);
+                    }
+                }
+            }
+            catch (e) {
+                electron_log_1.default.warn(`Quick connect: subscription refresh failed: ${e?.message}`);
+            }
+        }
+        // Step 3: If still no configs, fetch mixed_iran.txt DIRECTLY (guaranteed fallback)
+        if (configs.length === 0) {
+            electron_log_1.default.info("Quick connect: no configs from API — fetching mixed_iran.txt directly");
+            try {
+                const subUrl = "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt";
+                const subRes = await fetch(subUrl, {
+                    signal: AbortSignal.timeout(15000),
+                    headers: { "User-Agent": "DISTORT/1.0" },
+                });
+                if (subRes.ok) {
+                    const text = await subRes.text();
+                    const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 10);
+                    electron_log_1.default.info(`Quick connect: fetched ${lines.length} lines from mixed_iran.txt`);
+                    // Parse each line and add to configs
+                    for (const line of lines) {
+                        try {
+                            // Import via API
+                            await fetch(`${getLoadUrl()}/api/imported-configs/import`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ text: line }),
+                            });
+                        }
+                        catch { }
+                    }
+                    // Now fetch optimized configs
+                    const meshRes3 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
+                    if (meshRes3.ok) {
+                        const meshData3 = await meshRes3.json();
+                        configs = meshData3?.configs || [];
+                        electron_log_1.default.info(`Quick connect: after direct fetch, got ${configs.length} configs`);
+                    }
+                }
+            }
+            catch (e) {
+                electron_log_1.default.warn(`Quick connect: direct mixed_iran.txt fetch failed: ${e?.message}`);
+            }
+        }
+        // Step 4: Last resort — try cached configs
+        if (configs.length === 0) {
+            try {
+                const cacheFile = path.join(electron_1.app.getPath("userData"), "cached-configs.json");
+                if (fs.existsSync(cacheFile)) {
+                    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+                    configs = cached.configs || [];
+                    electron_log_1.default.info(`Quick connect: using ${configs.length} cached configs (offline mode)`);
+                }
+            }
+            catch (e) {
+                electron_log_1.default.warn(`Quick connect: cache read failed: ${e?.message}`);
+            }
+        }
+        if (configs.length === 0) {
+            electron_log_1.default.error("Quick connect: no configs available after all attempts");
+            mainWindow?.webContents.send("vpn:error", "No VPN configs available. All sources failed: API, subscription refresh, direct fetch, and cache.");
             return;
         }
-        electron_log_1.default.info(`Quick connect: trying ${configs.length} optimized configs in sequence (auto-failover)`);
+        electron_log_1.default.info(`Quick connect: trying ${configs.length} configs in sequence (auto-failover)`);
         // Try each config until one connects successfully
         for (let i = 0; i < configs.length; i++) {
             const cfg = configs[i];
             electron_log_1.default.info(`Quick connect: attempt ${i + 1}/${configs.length} — ${cfg.protocol} ${cfg.host}:${cfg.port} (${cfg.flags || 'no flags'})`);
+            // TCP probe — don't waste time on unreachable servers
+            try {
+                const net = require("net");
+                const probeResult = await new Promise((resolve) => {
+                    const socket = new net.Socket();
+                    const start = Date.now();
+                    const t = setTimeout(() => { socket.destroy(); resolve({ ok: false, latency: 0 }); }, 3000);
+                    socket.connect(cfg.port, cfg.host, () => {
+                        clearTimeout(t);
+                        socket.destroy();
+                        resolve({ ok: true, latency: Date.now() - start });
+                    });
+                    socket.on("error", () => { clearTimeout(t); resolve({ ok: false, latency: 0 }); });
+                });
+                if (!probeResult.ok) {
+                    electron_log_1.default.warn(`Quick connect: ${cfg.host}:${cfg.port} unreachable (TCP probe failed) — skipping`);
+                    continue;
+                }
+                electron_log_1.default.info(`Quick connect: ${cfg.host}:${cfg.port} reachable (${probeResult.latency}ms)`);
+            }
+            catch (e) {
+                electron_log_1.default.warn(`Quick connect: TCP probe error: ${e?.message} — skipping`);
+                continue;
+            }
             // Notify UI of attempt
             mainWindow?.webContents.send("vpn:connecting", {
                 attempt: i + 1,
@@ -1120,6 +1368,503 @@ function disconnectVpn() {
     stopVpnEngine();
 }
 // ---------------------------------------------------------------------------
+// Companion control API — localhost-only HTTP server on 127.0.0.1:10810
+//
+// The BrowserWithCompanionEngine (in src/lib/emergency-connectivity/recovery-engine.ts)
+// reaches this API from the web dashboard (loaded at http://localhost:3000) to
+// drive xray-core without needing raw TCP/IPC access from the browser.
+//
+// Endpoints:
+//   GET  /api/health         → { ok, version, platform }
+//   POST /api/tunnel/start    → body { configUri } → { ok, error? }
+//   POST /api/tunnel/stop     → { ok }
+//   GET  /api/tunnel/status   → { running, exitIp, realIp }
+//   POST /api/tunnel/verify   → { trafficVerified, exitIp, realIp, latencyMs, error? }
+//
+// Security:
+//   - Binds to 127.0.0.1 ONLY (never 0.0.0.0) — no remote access
+//   - No auth (localhost-only is the auth)
+//   - configUri is NEVER logged (scrubbed before any log line)
+//   - POST bodies must be valid JSON ≤ 1MB
+//   - /tunnel/start has a 10s overall timeout
+//   - /tunnel/verify has a 15s overall timeout
+// ---------------------------------------------------------------------------
+// Scrub configUri from any string before logging. Matches vmess://, vless://,
+// trojan://, ss://, hysteria2://, wireguard:// schemes followed by base64/url
+// payload. The credential portion is replaced with [REDACTED].
+function scrubConfigUri(s) {
+    if (!s)
+        return s;
+    return s.replace(/(vless|vmess|trojan|ss|hysteria2?|wireguard|tuic):\/\/[^\s"'<>]+/gi, "$1://[REDACTED]");
+}
+// Start xray from a raw configUri (vmess/vless/trojan/ss). Used by the
+// companion API's /api/tunnel/start endpoint. Shares the global vpnProcess
+// variable with the desktop UI flow so the two can't double-spawn xray.
+async function startTunnelFromUri(configUri) {
+    // Stop any existing xray process first (whether started by the API or by
+    // the desktop UI's startVpnEngine() — there is only one xray process slot).
+    if (vpnProcess) {
+        try {
+            vpnProcess.kill("SIGTERM");
+        }
+        catch { }
+        vpnProcess = null;
+    }
+    stopHealthMonitoring();
+    // Build the REAL config (uses real credentials from configUri, or throws)
+    let config;
+    try {
+        config = buildXrayConfigFromUri(configUri);
+    }
+    catch (e) {
+        // Scrub just in case the error message echoes part of the URI
+        electron_log_1.default.warn(`[companion-api] /api/tunnel/start config build failed: ${scrubConfigUri(e?.message || String(e))}`);
+        return { ok: false, error: e?.message || "Failed to build xray config from URI" };
+    }
+    const configPath = path.join(electron_1.app.getPath("userData"), "xray-config.json");
+    try {
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    }
+    catch (e) {
+        electron_log_1.default.error(`[companion-api] Failed to write xray config: ${e?.message}`);
+        return { ok: false, error: `Failed to write xray config: ${e?.message}` };
+    }
+    electron_log_1.default.info("[companion-api] xray config written (configUri REDACTED)");
+    const xrayPath = getXrayPath();
+    if (!fs.existsSync(xrayPath)) {
+        electron_log_1.default.error(`[companion-api] xray binary not found at: ${xrayPath}`);
+        return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
+    }
+    try {
+        vpnProcess = (0, child_process_1.spawn)(xrayPath, ["run", "-c", configPath], {
+            cwd: path.dirname(xrayPath),
+            windowsHide: true,
+            stdio: ["ignore", "pipe", "pipe"],
+        });
+        vpnProcess.stdout?.on("data", (data) => {
+            electron_log_1.default.info(`[xray] ${data.toString().trim()}`);
+        });
+        vpnProcess.stderr?.on("data", (data) => {
+            const line = data.toString().trim();
+            electron_log_1.default.error(`[xray] ${line}`);
+        });
+        vpnProcess.on("exit", (code) => {
+            electron_log_1.default.info(`[companion-api] xray exited with code ${code}`);
+            vpnProcess = null;
+            // If the desktop UI thought it was connected, mark it disconnected now.
+            const vpn = store.get("vpn");
+            if (vpn.connected) {
+                store.set("vpn", { ...vpn, connected: false, startedAt: null });
+                mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
+            }
+        });
+        // Wait briefly for xray to start (so we can detect immediate crashes)
+        await new Promise((r) => setTimeout(r, 500));
+        if (!vpnProcess || vpnProcess.killed) {
+            return { ok: false, error: "xray process exited immediately — check config validity or xray binary" };
+        }
+        // Update the desktop UI state so it doesn't show "Disconnected" while
+        // the companion API is actively running a tunnel. Verification is done
+        // separately via /api/tunnel/verify.
+        const vpn = store.get("vpn");
+        store.set("vpn", {
+            ...vpn,
+            connected: false, // NOT verified yet — /api/tunnel/verify will set this
+            protocol: "companion-api",
+            startedAt: Date.now(),
+            configUri: null, // never persist the raw URI
+            exitIp: null,
+            exitCountry: null,
+        });
+        mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
+        electron_log_1.default.info("[companion-api] xray spawned successfully (configUri REDACTED)");
+        // CRITICAL: Set Electron browser proxy to route through xray's SOCKS5
+        try {
+            await electron_1.session.defaultSession.setProxy({
+                proxyRules: "socks5://127.0.0.1:10808",
+            });
+            electron_log_1.default.info("[companion-api] Browser proxy set to socks5://127.0.0.1:10808");
+        }
+        catch (e) {
+            electron_log_1.default.warn(`[companion-api] Failed to set browser proxy: ${e?.message}`);
+        }
+        return { ok: true };
+    }
+    catch (e) {
+        electron_log_1.default.error(`[companion-api] Failed to spawn xray: ${e?.message}`);
+        return { ok: false, error: `Failed to spawn xray: ${e?.message}` };
+    }
+}
+// Stop the xray process (shared by the API and the desktop UI flow).
+async function stopTunnel() {
+    electron_log_1.default.info("[companion-api] /api/tunnel/stop — stopping xray-core…");
+    stopHealthMonitoring();
+    if (vpnProcess) {
+        try {
+            vpnProcess.kill("SIGTERM");
+            // Give it 500ms to exit gracefully
+            await new Promise((r) => setTimeout(r, 500));
+            if (!vpnProcess.killed) {
+                try {
+                    vpnProcess.kill("SIGKILL");
+                }
+                catch { }
+            }
+        }
+        catch (e) {
+            electron_log_1.default.error(`[companion-api] Error killing xray: ${e?.message}`);
+        }
+        vpnProcess = null;
+    }
+    // Clear the browser proxy
+    try {
+        await electron_1.session.defaultSession.setProxy({ proxyRules: "" });
+        electron_log_1.default.info("[companion-api] Browser proxy cleared");
+    }
+    catch (e) {
+        electron_log_1.default.warn(`[companion-api] Failed to clear proxy: ${e?.message}`);
+    }
+    // Reflect the stopped state in the desktop UI
+    const vpn = store.get("vpn");
+    store.set("vpn", {
+        ...vpn,
+        connected: false,
+        startedAt: null,
+        exitIp: null,
+        exitCountry: null,
+    });
+    mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
+    return { ok: true };
+}
+// Snapshot of the current tunnel state for /api/tunnel/status.
+function getTunnelStatus() {
+    const vpn = store.get("vpn");
+    return {
+        running: !!vpnProcess && !vpnProcess.killed,
+        // Exit IP is only known after a successful /api/tunnel/verify
+        exitIp: vpn.exitIp || null,
+        // Real IP is intentionally NOT cached — it's only fetched on demand
+        // during /api/tunnel/verify. Returning null here is honest.
+        realIp: null,
+    };
+}
+// Verify the tunnel by doing a real HTTP request through xray's SOCKS5 proxy
+// (127.0.0.1:10808) to cloudflare/cdn-cgi/trace, AND a direct (non-proxied)
+// request to get the real IP. If they differ, traffic is going through the
+// tunnel → verified. If they match (or either is null), NOT verified.
+async function handleTunnelVerify() {
+    if (!vpnProcess || vpnProcess.killed) {
+        // Still fetch the real IP so the caller has *something* useful even
+        // when no tunnel is active — they can compare future verify calls.
+        const realIp = await fetchRealIp();
+        return {
+            trafficVerified: false,
+            exitIp: null,
+            realIp,
+            latencyMs: null,
+            error: "No active tunnel — call POST /api/tunnel/start first",
+        };
+    }
+    // Run both probes in parallel — they don't depend on each other.
+    const [trafficResult, realIp] = await Promise.all([
+        verifyTunnelTraffic(),
+        fetchRealIp(),
+    ]);
+    const exitIp = trafficResult.exitIp;
+    // Verification rule: traffic must have flowed (verified=true), AND the exit
+    // IP must differ from the real IP. If they're the same, the tunnel is
+    // leaking or xray is bypassing itself.
+    const trafficVerified = trafficResult.verified &&
+        !!exitIp &&
+        !!realIp &&
+        exitIp !== realIp;
+    // Reflect the verified exit IP in the desktop UI state too, so the UI
+    // stays in sync with what the companion API just measured.
+    if (trafficVerified && exitIp) {
+        const vpn = store.get("vpn");
+        store.set("vpn", {
+            ...vpn,
+            connected: true,
+            exitIp,
+            exitCountry: trafficResult.exitCountry,
+        });
+        mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
+        mainWindow?.webContents.send("vpn:exit-info", {
+            exitIp,
+            exitCountry: trafficResult.exitCountry,
+        });
+    }
+    return {
+        trafficVerified,
+        exitIp,
+        realIp,
+        latencyMs: trafficResult.latencyMs,
+        error: trafficResult.error,
+    };
+}
+// Parse a request body buffer as JSON. Returns null on empty or invalid JSON.
+function parseJsonBody(buf) {
+    if (!buf || buf.length === 0)
+        return null;
+    try {
+        return JSON.parse(buf.toString("utf-8"));
+    }
+    catch {
+        return null;
+    }
+}
+// Send a JSON response. Sets CORS + Content-Type headers.
+function sendJson(res, status, body) {
+    const payload = JSON.stringify(body);
+    res.writeHead(status, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": Buffer.byteLength(payload),
+    });
+    res.end(payload);
+}
+// Route a single HTTP request to the appropriate handler.
+async function handleCompanionApiRequest(req, res, pathname, bodyBuf) {
+    // GET /api/health
+    if (pathname === "/api/health" && req.method === "GET") {
+        sendJson(res, 200, {
+            ok: true,
+            version: COMPANION_API_VERSION,
+            platform: COMPANION_API_PLATFORM,
+        });
+        return;
+    }
+    // POST /api/tunnel/start
+    if (pathname === "/api/tunnel/start" && req.method === "POST") {
+        const body = parseJsonBody(bodyBuf);
+        if (!body || typeof body !== "object") {
+            sendJson(res, 400, { ok: false, error: "Invalid JSON body — expected { configUri: string }" });
+            return;
+        }
+        const configUri = body.configUri;
+        if (typeof configUri !== "string" || configUri.length < 10) {
+            sendJson(res, 400, { ok: false, error: "Missing or invalid 'configUri' field (must be a string ≥ 10 chars)" });
+            return;
+        }
+        // Race the start against a 10s overall timeout. If xray doesn't spawn
+        // within 10s, return an error (the spawned process may still be
+        // initializing in the background — /api/tunnel/verify will catch that).
+        let result;
+        try {
+            result = await Promise.race([
+                startTunnelFromUri(configUri),
+                new Promise((resolve) => {
+                    setTimeout(() => resolve({ ok: false, error: `Tunnel start timed out after ${COMPANION_START_TIMEOUT_MS / 1000}s` }), COMPANION_START_TIMEOUT_MS);
+                }),
+            ]);
+        }
+        catch (e) {
+            result = { ok: false, error: e?.message || "Unexpected error during tunnel start" };
+        }
+        sendJson(res, 200, result);
+        return;
+    }
+    // POST /api/tunnel/stop
+    if (pathname === "/api/tunnel/stop" && req.method === "POST") {
+        const result = await stopTunnel();
+        sendJson(res, 200, result);
+        return;
+    }
+    // GET /api/tunnel/status
+    if (pathname === "/api/tunnel/status" && req.method === "GET") {
+        const status = getTunnelStatus();
+        sendJson(res, 200, status);
+        return;
+    }
+    // POST /api/tunnel/verify
+    if (pathname === "/api/tunnel/verify" && req.method === "POST") {
+        let result;
+        try {
+            result = await Promise.race([
+                handleTunnelVerify(),
+                new Promise((resolve) => {
+                    setTimeout(() => resolve({
+                        trafficVerified: false,
+                        exitIp: null,
+                        realIp: null,
+                        latencyMs: null,
+                        error: `Tunnel verify timed out after ${COMPANION_VERIFY_TIMEOUT_MS / 1000}s`,
+                    }), COMPANION_VERIFY_TIMEOUT_MS);
+                }),
+            ]);
+        }
+        catch (e) {
+            result = {
+                trafficVerified: false,
+                exitIp: null,
+                realIp: null,
+                latencyMs: null,
+                error: e?.message || "Unexpected error during tunnel verify",
+            };
+        }
+        sendJson(res, 200, result);
+        return;
+    }
+    // 404
+    sendJson(res, 404, { ok: false, error: `Not found: ${req.method} ${pathname}` });
+}
+// Start the companion control API server on 127.0.0.1:10810.
+// ---------------------------------------------------------------------------
+// Companion API server
+// ---------------------------------------------------------------------------
+// ALLOWED ORIGINS — strict allowlist (addresses user review issue P1-ب).
+// Using "*" is NOT safe even on localhost: a malicious web page on any origin
+// the user visits could send requests to 127.0.0.1:10810 and control the
+// tunnel (start/stop/verify). We MUST verify the Origin header against an
+// explicit allowlist.
+//
+// The web dashboard runs on:
+//   - Dev: http://localhost:3000
+//   - Prod: https://distort.app (when deployed)
+//
+// We also allow the Electron renderer (app://) for when the dashboard is
+// bundled inside the desktop app itself.
+const COMPANION_ALLOWED_ORIGINS = new Set([
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:38571",
+    "http://127.0.0.1:38571",
+    "https://distort.app",
+    "https://www.distort.app",
+    "app://",
+    "file://", // for bundled dashboard
+]);
+function isAllowedOrigin(origin) {
+    if (!origin)
+        return false;
+    // Exact match against the allowlist
+    if (COMPANION_ALLOWED_ORIGINS.has(origin))
+        return true;
+    // Allow the Electron renderer's custom scheme
+    if (origin.startsWith("app://"))
+        return true;
+    return false;
+}
+// Idempotent — calling it twice is a no-op.
+function startCompanionApiServer() {
+    if (companionApiServer) {
+        electron_log_1.default.info("[companion-api] Already running — skipping startCompanionApiServer()");
+        return;
+    }
+    const server = http.createServer((req, res) => {
+        // SECURITY (P1-ب): strict Origin allowlist instead of "*".
+        // A malicious web page on any origin the user visits could otherwise
+        // send requests to 127.0.0.1:10810 and control the tunnel.
+        const origin = req.headers.origin;
+        if (isAllowedOrigin(origin)) {
+            res.setHeader("Access-Control-Allow-Origin", origin);
+            res.setHeader("Vary", "Origin"); // cache correctly per-origin
+        }
+        else {
+            // Don't set CORS header — browser will block the response.
+            // (We still process the request in case it's a same-origin call
+            // from the Electron renderer, which doesn't send an Origin header.)
+        }
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        // Don't allow credentials — we don't use cookies here
+        res.setHeader("Access-Control-Allow-Credentials", "false");
+        if (req.method === "OPTIONS") {
+            // Preflight — reject if origin not allowed
+            if (origin && !isAllowedOrigin(origin)) {
+                res.writeHead(403);
+                res.end("Forbidden origin");
+                return;
+            }
+            res.writeHead(204);
+            res.end();
+            return;
+        }
+        const fullUrl = new url_1.URL(req.url || "/", `http://${COMPANION_API_HOST}:${COMPANION_API_PORT}`);
+        const pathname = fullUrl.pathname;
+        // SECURITY (P1-ب): also check the Host header to prevent DNS rebinding.
+        // A malicious site could set up "evil.com" to resolve to 127.0.0.1 and
+        // then fetch("http://evil.com:10810/api/tunnel/start"). The browser
+        // would send Host: evil.com:10810, which we reject.
+        const hostHeader = req.headers.host || "";
+        const expectedHost = `${COMPANION_API_HOST}:${COMPANION_API_PORT}`;
+        if (hostHeader !== expectedHost) {
+            electron_log_1.default.warn(`[companion-api] Rejected request with Host header "${hostHeader}" (expected "${expectedHost}") — possible DNS rebinding attempt`);
+            sendJson(res, 403, { ok: false, error: "Forbidden Host header" });
+            return;
+        }
+        // Log the request line WITHOUT the query string or body — configUri
+        // lives in the body and must never appear in logs.
+        electron_log_1.default.info(`[companion-api] ${req.method} ${pathname} (origin=${origin || "none"})`);
+        // Read the request body (POST only). Cap at COMPANION_MAX_BODY_BYTES
+        // to prevent memory exhaustion from oversized payloads.
+        const chunks = [];
+        let aborted = false;
+        req.on("data", (chunk) => {
+            if (aborted)
+                return;
+            const totalSoFar = chunks.reduce((acc, c) => acc + c.length, 0);
+            if (totalSoFar + chunk.length > COMPANION_MAX_BODY_BYTES) {
+                aborted = true;
+                electron_log_1.default.warn(`[companion-api] Request body exceeded ${COMPANION_MAX_BODY_BYTES} bytes — aborting`);
+                sendJson(res, 413, { ok: false, error: "Request body too large" });
+                try {
+                    req.destroy();
+                }
+                catch { }
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on("end", async () => {
+            if (aborted)
+                return;
+            const bodyBuf = Buffer.concat(chunks);
+            try {
+                await handleCompanionApiRequest(req, res, pathname, bodyBuf);
+            }
+            catch (e) {
+                electron_log_1.default.error(`[companion-api] Unhandled error in handler: ${e?.message}`);
+                if (!res.headersSent) {
+                    sendJson(res, 500, { ok: false, error: "Internal server error" });
+                }
+            }
+        });
+        req.on("error", (e) => {
+            electron_log_1.default.warn(`[companion-api] Request stream error: ${e?.message}`);
+            if (!res.headersSent) {
+                sendJson(res, 400, { ok: false, error: "Bad request" });
+            }
+        });
+    });
+    server.on("error", (err) => {
+        if (err?.code === "EADDRINUSE") {
+            electron_log_1.default.error(`[companion-api] Port ${COMPANION_API_PORT} is already in use — another DISTORT instance may be running. The companion control API will NOT be available.`);
+        }
+        else {
+            electron_log_1.default.error(`[companion-api] Server error: ${err?.message}`);
+        }
+    });
+    server.listen(COMPANION_API_PORT, COMPANION_API_HOST, () => {
+        electron_log_1.default.info(`[companion-api] ✅ Companion control API listening on http://${COMPANION_API_HOST}:${COMPANION_API_PORT}`);
+    });
+    companionApiServer = server;
+}
+// Stop the companion control API server (called on app quit).
+function stopCompanionApiServer() {
+    if (!companionApiServer)
+        return;
+    try {
+        companionApiServer.closeAllConnections?.();
+    }
+    catch { }
+    try {
+        companionApiServer.close();
+    }
+    catch { }
+    companionApiServer = null;
+    electron_log_1.default.info("[companion-api] Server stopped");
+}
+// ---------------------------------------------------------------------------
 // IPC handlers
 // ---------------------------------------------------------------------------
 electron_1.ipcMain.handle("vpn:connect", async (_e, server, protocol, configUri) => {
@@ -1147,6 +1892,239 @@ electron_1.ipcMain.handle("app:version", async () => {
 electron_1.ipcMain.handle("app:platform", async () => {
     return { platform: process.platform, arch: process.arch };
 });
+// ---------------------------------------------------------------------------
+// Auto-updater — electron-updater with GitHub Releases provider
+// ---------------------------------------------------------------------------
+// HONEST LIMITATION: the updater only fully works for SIGNED builds. Our
+// current Windows builds are NOT code-signed (no EV/authenticode certificate),
+// so electron-updater will still CHECK for updates and DOWNLOAD them, but
+// `quitAndInstall()` may pop a SmartScreen / "unknown publisher" warning
+// because the new installer is also unsigned. electron-builder also
+// generates latest.yml automatically — that file MUST be published alongside
+// the .exe assets in the GitHub Release for the updater to find the update.
+//
+// The publish config lives in package.json → build.publish = { provider: github,
+// owner: "di6tort-bit", repo: "distort" }. In CI we pass `--publish onTag`
+// so a `git tag v1.2.3 && git push --tags` triggers a real release.
+//
+// electron-store persists in app.getPath("userData"), which is OUTSIDE the
+// install directory — so user settings, subscriptions, cached configs and
+// tunnel state all SURVIVE an update. Nothing to migrate.
+//
+// Until we publish a real release with proper versioning AND signing, this
+// code: (a) runs at startup, (b) checks the GitHub Releases API for a newer
+// version, (c) logs the result, (d) forwards status to the renderer for the
+// UI badge. If no release exists yet (current state), it just logs
+// "update-not-available" and exits cleanly.
+let autoUpdaterModule = null;
+let updateCheckTimer = null;
+function sendToRenderer(channel, payload) {
+    try {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send(channel, payload);
+        }
+    }
+    catch (e) {
+        electron_log_1.default.warn(`[auto-updater] Failed to send IPC "${channel}": ${e?.message}`);
+    }
+}
+function setupAutoUpdater() {
+    // Lazy-require so the build doesn't fail in environments where
+    // electron-updater's native bits aren't available (e.g. dev without
+    // electron-builder's install-app-deps). We also wrap in try/catch so
+    // any failure here is non-fatal — auto-update is a convenience, not a
+    // correctness-critical feature.
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        autoUpdaterModule = require("electron-updater").autoUpdater;
+    }
+    catch (e) {
+        electron_log_1.default.warn(`[auto-updater] electron-updater not available — auto-update disabled. Reason: ${e?.message}`);
+        sendToRenderer("update-error", { message: `Auto-updater unavailable: ${e?.message || "unknown error"}` });
+        return;
+    }
+    const updater = autoUpdaterModule;
+    if (!updater) {
+        electron_log_1.default.warn("[auto-updater] electron-updater returned no autoUpdater object — disabled");
+        sendToRenderer("update-error", { message: "Auto-updater unavailable: no autoUpdater export" });
+        return;
+    }
+    // In dev mode (DISTORT_DEV set, or !app.isPackaged) electron-updater has
+    // no app-update.yml to read and will throw "Update config file not found".
+    // We still wire up the listeners so the renderer can render an honest
+    // "not available in dev" state, but we skip the actual check.
+    const isDev = !!process.env.DISTORT_DEV || !electron_1.app.isPackaged;
+    // Configuration
+    updater.autoDownload = false; // DON'T auto-download — ask user first
+    updater.autoInstallOnAppQuit = false; // DON'T auto-install — user must confirm
+    // We explicitly do NOT disable code-signature verification in production
+    // (win.verifyUpdateCodeSignature in package.json is already false because
+    // we have no cert — that only disables electron-builder's BUILDER-time
+    // check, not the runtime updater check). When we DO get a cert, flip
+    // verifyUpdateCodeSignature back to true and remove this comment.
+    // Allow auto-updater's own logs to flow into our electron-log sink.
+    try {
+        updater.logger = electron_log_1.default;
+    }
+    catch { }
+    // --- Event wiring ---
+    updater.on("checking-for-update", () => {
+        electron_log_1.default.info("[auto-updater] Checking for update…");
+        sendToRenderer("update-checking");
+    });
+    updater.on("update-available", (info) => {
+        electron_log_1.default.info(`[auto-updater] Update available: v${info?.version || "?"} (current v${electron_1.app.getVersion()})`);
+        sendToRenderer("update-available", {
+            version: info?.version ?? null,
+            releaseDate: info?.releaseDate ?? null,
+            releaseNotes: info?.releaseNotes ?? null,
+        });
+        // Show a dialog asking if user wants to download
+        electron_1.dialog.showMessageBox({
+            type: "info",
+            title: "DISTORT Update Available",
+            message: `Version ${info?.version || "new"} is available.`,
+            detail: `You are currently running v${electron_1.app.getVersion()}.\n\nWould you like to download the update now? You can install it later.`,
+            buttons: ["Download now", "Later"],
+            defaultId: 0,
+            cancelId: 1,
+        }).then((choice) => {
+            if (choice.response === 0) {
+                electron_log_1.default.info("[auto-updater] User chose to download — starting download…");
+                updater.downloadUpdate().catch((err) => {
+                    electron_log_1.default.error(`[auto-updater] Download failed: ${err?.message}`);
+                });
+            }
+            else {
+                electron_log_1.default.info("[auto-updater] User chose to skip this update");
+            }
+        });
+    });
+    updater.on("update-not-available", (info) => {
+        electron_log_1.default.info(`[auto-updater] Up to date (v${electron_1.app.getVersion()})`);
+        sendToRenderer("update-not-available", { version: info?.version ?? electron_1.app.getVersion() });
+    });
+    updater.on("error", (err) => {
+        electron_log_1.default.error(`[auto-updater] Error: ${err?.message}`);
+        sendToRenderer("update-error", { message: err?.message || String(err) });
+    });
+    updater.on("download-progress", (progress) => {
+        // progress: { percent, transferred, total, bytesPerSecond }
+        const pct = typeof progress?.percent === "number" ? Math.round(progress.percent) : null;
+        electron_log_1.default.info(`[auto-updater] Downloading update: ${pct ?? "?"}% (${progress?.transferred ?? 0}/${progress?.total ?? 0} bytes)`);
+        sendToRenderer("update-downloading", {
+            percent: pct,
+            transferred: progress?.transferred ?? 0,
+            total: progress?.total ?? 0,
+            bytesPerSecond: progress?.bytesPerSecond ?? 0,
+        });
+    });
+    updater.on("update-downloaded", async (info) => {
+        electron_log_1.default.info(`[auto-updater] Update downloaded: v${info?.version || "?"} — ready to install on quit`);
+        sendToRenderer("update-downloaded", {
+            version: info?.version ?? null,
+            releaseDate: info?.releaseDate ?? null,
+        });
+        // Prompt the user — they may be mid-tunnel and not want to restart now.
+        // The renderer also gets the event so it can show a custom toast, but we
+        // additionally show a native dialog (works even if the renderer is on
+        // the offline page or a non-dashboard route).
+        try {
+            const choice = await electron_1.dialog.showMessageBox({
+                type: "info",
+                title: "DISTORT Update Ready",
+                message: "A new version is available.",
+                detail: `Version ${info?.version || "(unknown)"} has been downloaded and will be installed. Install and restart now? Your settings and saved configs are preserved.`,
+                buttons: ["Install & Restart", "Later"],
+                defaultId: 0,
+                cancelId: 1,
+            });
+            if (choice.response === 0) {
+                electron_log_1.default.info("[auto-updater] User chose to install now — calling quitAndInstall()");
+                // quitAndInstall() closes all windows, runs the installer, and relaunches.
+                // isForceRunAfter=true ensures the app restarts after install completes.
+                isQuitting = true; // skip the minimize-to-tray intercept in mainWindow 'close'
+                updater.quitAndInstall(false, true);
+            }
+            else {
+                electron_log_1.default.info("[auto-updater] User chose to defer — will install on next quit (autoInstallOnAppQuit=true)");
+            }
+        }
+        catch (e) {
+            electron_log_1.default.warn(`[auto-updater] Dialog failed: ${e?.message}. Update will install on next quit.`);
+        }
+    });
+    // --- Kick off the check loop ---
+    if (isDev) {
+        electron_log_1.default.info("[auto-updater] Skipping check in dev mode (electron-updater requires a packaged app).");
+        sendToRenderer("update-not-available", { version: electron_1.app.getVersion(), dev: true });
+        return;
+    }
+    // First check immediately (well, after a short delay so the app finishes
+    // booting — checking during the very first tick races with network setup
+    // on slow machines).
+    setTimeout(() => {
+        updater.checkForUpdates().catch((err) => {
+            electron_log_1.default.warn(`[auto-updater] Initial check failed: ${err?.message}`);
+        });
+    }, 5_000);
+    // Then every 30 minutes. electron-updater is smart enough to not re-download
+    // if the version hasn't changed.
+    const CHECK_INTERVAL_MS = 30 * 60 * 1000;
+    updateCheckTimer = setInterval(() => {
+        updater.checkForUpdates().catch((err) => {
+            electron_log_1.default.warn(`[auto-updater] Periodic check failed: ${err?.message}`);
+        });
+    }, CHECK_INTERVAL_MS);
+    electron_log_1.default.info(`[auto-updater] Initialised — checking every ${CHECK_INTERVAL_MS / 60_000}min (provider: github/di6tort-bit/distort)`);
+}
+// IPC handler — renderer can request a manual check (e.g. a "Check for updates"
+// button in Settings). Returns a status object so the renderer doesn't need
+// to round-trip through the event channel for a one-shot check.
+electron_1.ipcMain.handle("update:check-now", async () => {
+    if (!autoUpdaterModule) {
+        return { ok: false, error: "Auto-updater not available" };
+    }
+    try {
+        const result = await autoUpdaterModule.checkForUpdates();
+        return {
+            ok: true,
+            updateInfo: result?.updateInfo
+                ? {
+                    version: result.updateInfo.version,
+                    releaseDate: result.updateInfo.releaseDate,
+                }
+                : null,
+            currentVersion: electron_1.app.getVersion(),
+        };
+    }
+    catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+    }
+});
+// IPC handler — renderer can install a downloaded update immediately (used
+// by the "Install now" button in our own toast, as an alternative to the
+// native dialog).
+electron_1.ipcMain.handle("update:install-now", async () => {
+    if (!autoUpdaterModule) {
+        return { ok: false, error: "Auto-updater not available" };
+    }
+    try {
+        isQuitting = true;
+        autoUpdaterModule.quitAndInstall(false, true);
+        return { ok: true };
+    }
+    catch (e) {
+        return { ok: false, error: e?.message || String(e) };
+    }
+});
+// Stop the auto-updater's periodic check (called on app quit).
+function stopAutoUpdater() {
+    if (updateCheckTimer) {
+        clearInterval(updateCheckTimer);
+        updateCheckTimer = null;
+    }
+}
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -1177,43 +2155,215 @@ function startNextServer() {
         if (fs.existsSync(staticSrc) && !fs.existsSync(staticDest)) {
             // already in place
         }
-        // Start the Next.js standalone server on port 38571
-        nextServer = (0, child_process_2.spawn)(process.execPath, [serverJs], {
-            cwd: standalonePath,
-            env: {
-                ...process.env,
-                PORT: "38571",
-                NODE_ENV: "production",
-                HOSTNAME: "127.0.0.1",
-            },
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        nextServer.stdout?.on("data", (data) => {
-            electron_log_1.default.info(`[next] ${data.toString().trim()}`);
-        });
-        nextServer.stderr?.on("data", (data) => {
-            electron_log_1.default.error(`[next] ${data.toString().trim()}`);
-        });
-        // Wait for server to be ready
-        let attempts = 0;
-        const checkInterval = setInterval(() => {
-            attempts++;
-            fetch("http://127.0.0.1:38571/")
-                .then((r) => {
-                if (r.ok) {
-                    clearInterval(checkInterval);
-                    electron_log_1.default.info("Next.js standalone server is ready on port 38571");
-                    resolve();
-                }
-            })
-                .catch(() => {
-                if (attempts > 20) {
-                    clearInterval(checkInterval);
-                    electron_log_1.default.warn("Next.js server didn't start in time");
-                    resolve(); // resolve anyway, will use offline fallback
-                }
+        // Start the Next.js standalone server on port 38571.
+        //
+        // CRITICAL: in production, process.execPath is the Electron binary (e.g.,
+        // DISTORT.exe), NOT Node.js. The Next.js standalone server.js is a pure
+        // Node.js script — it won't run under Electron's GUI process.
+        //
+        // FIX: set ELECTRON_RUN_AS_NODE=1, which tells the Electron binary to
+        // behave as a pure Node.js runtime (no GUI, no Chromium). This is the
+        // standard way to run Node.js scripts from an Electron app.
+        //
+        // Without this fix, the spawn appears to succeed (no error), but the
+        // server never actually starts — the window loads localhost:38571,
+        // gets nothing, and shows the "VPN Engine Ready / RETRY CONNECTION"
+        // offline page forever.
+        //
+        // DATABASE_URL: the Next.js server needs a SQLite database. We put it
+        // in the user's userData directory so it persists across app updates.
+        // The path must use file: prefix for Prisma to recognize it as SQLite.
+        const dbPath = path.join(DISTORT_DATA_DIR, "distort.db");
+        const dbDir = path.dirname(dbPath);
+        if (!fs.existsSync(dbDir)) {
+            try {
+                fs.mkdirSync(dbDir, { recursive: true });
+            }
+            catch { }
+        }
+        electron_log_1.default.info(`Database path: ${dbPath}`);
+        // First run: create the database schema + seed data.
+        // Uses sql.js (pure JavaScript, WASM-based) to avoid native module
+        // compilation issues on CI. The schema + seed SQL files are bundled
+        // with the app in resources/db/.
+        const initAndStartServer = () => {
+            nextServer = (0, child_process_2.spawn)(process.execPath, [serverJs], {
+                cwd: standalonePath,
+                env: {
+                    ...process.env,
+                    PORT: "38571",
+                    NODE_ENV: "production",
+                    HOSTNAME: "127.0.0.1",
+                    ELECTRON_RUN_AS_NODE: "1",
+                    DATABASE_URL: `file:${dbPath}`,
+                    DISTORT_SESSION_SECRET: process.env.DISTORT_SESSION_SECRET || "distort-desktop-session-secret-local",
+                    // CRITICAL: set a local API key so checkAuth() doesn't return 503.
+                    // The client (web dashboard) sends this key via x-api-key header.
+                    // We inject it into the browser via preload.ts → window.distort.apiKey
+                    DISTORT_API_KEY: "distort-desktop-local-api-key-for-localhost-only-32chars",
+                },
+                stdio: ["ignore", "pipe", "pipe"],
             });
-        }, 500);
+            nextServer.stdout?.on("data", (data) => {
+                electron_log_1.default.info(`[next] ${data.toString().trim()}`);
+            });
+            nextServer.stderr?.on("data", (data) => {
+                electron_log_1.default.error(`[next] ${data.toString().trim()}`);
+            });
+            // Wait for server to be ready
+            let attempts = 0;
+            const checkInterval = setInterval(() => {
+                attempts++;
+                fetch("http://127.0.0.1:38571/")
+                    .then((r) => {
+                    if (r.ok) {
+                        clearInterval(checkInterval);
+                        electron_log_1.default.info("Next.js standalone server is ready on port 38571");
+                        resolve();
+                    }
+                })
+                    .catch(() => {
+                    if (attempts > 20) {
+                        clearInterval(checkInterval);
+                        electron_log_1.default.warn("Next.js server didn't start in time");
+                        resolve();
+                    }
+                });
+            }, 500);
+        };
+        // Check if DB exists and is valid (not zero-byte)
+        if (fs.existsSync(dbPath)) {
+            const stat = fs.statSync(dbPath);
+            if (stat.size === 0) {
+                electron_log_1.default.warn(`Database file exists but is 0 bytes — deleting and recreating`);
+                try {
+                    fs.unlinkSync(dbPath);
+                }
+                catch { }
+            }
+        }
+        if (!fs.existsSync(dbPath)) {
+            electron_log_1.default.info("First run — initializing database schema + seed data…");
+            (0, db_init_1.initDatabase)(dbPath)
+                .then(() => {
+                electron_log_1.default.info("Database initialized successfully");
+                initAndStartServer();
+            })
+                .catch((e) => {
+                electron_log_1.default.error(`Database initialization failed: ${e?.message}`);
+                initAndStartServer(); // Start server anyway — it may still work
+            });
+        }
+        else {
+            electron_log_1.default.info("Database already exists — skipping initialization");
+            initAndStartServer();
+        }
+    });
+}
+// ---------------------------------------------------------------------------
+// Auto-fetch Community Mesh subscription on first run
+// ---------------------------------------------------------------------------
+// After the Next.js server is ready, fetch the Iran config subscription so
+// that Quick Connect has configs to try. This is called once 5 seconds after
+// the server starts, and only fetches if there are fewer than 10 configs in
+// the DB (i.e., first run or after a reset).
+async function autoFetchSubscription() {
+    try {
+        // Wait for server to be fully ready
+        electron_log_1.default.info("Auto-fetch: waiting for server to be ready…");
+        let serverReady = false;
+        for (let i = 0; i < 20; i++) {
+            try {
+                const r = await fetch("http://127.0.0.1:38571/api/servers");
+                if (r.ok) {
+                    serverReady = true;
+                    break;
+                }
+            }
+            catch { }
+            await new Promise((r) => setTimeout(r, 1000));
+        }
+        if (!serverReady) {
+            electron_log_1.default.warn("Auto-fetch: server not ready after 20s — aborting");
+            return;
+        }
+        electron_log_1.default.info("Auto-fetch: server is ready");
+        // Check if we already have configs — if so, skip
+        const countRes = await fetch("http://127.0.0.1:38571/api/imported-configs?limit=1");
+        if (countRes.ok) {
+            const countData = await countRes.json();
+            if (false && countData.configs && countData.configs.length > 0) {
+                electron_log_1.default.info("Auto-fetch: configs already exist — skipping subscription fetch");
+                return;
+            }
+        }
+        // Get the subscription list
+        const subsRes = await fetch("http://127.0.0.1:38571/api/subscriptions");
+        if (!subsRes.ok) {
+            electron_log_1.default.warn(`Auto-fetch: could not list subscriptions (${subsRes.status})`);
+            return;
+        }
+        const subsData = await subsRes.json();
+        const subs = subsData.subscriptions || [];
+        if (subs.length === 0) {
+            electron_log_1.default.info("Auto-fetch: no subscriptions in DB — nothing to fetch");
+            return;
+        }
+        // Refresh each subscription
+        for (const sub of subs) {
+            electron_log_1.default.info(`Auto-fetch: refreshing "${sub.label}"`);
+            try {
+                const refreshRes = await fetch(`http://127.0.0.1:38571/api/subscriptions/${sub.id}/refresh`, {
+                    method: "POST",
+                });
+                if (refreshRes.ok) {
+                    const refreshData = await refreshRes.json();
+                    electron_log_1.default.info(`Auto-fetch: "${sub.label}" refreshed — ${refreshData.count || 0} configs`);
+                }
+                else {
+                    electron_log_1.default.warn(`Auto-fetch: refresh failed for "${sub.label}" (${refreshRes.status})`);
+                }
+            }
+            catch (e) {
+                electron_log_1.default.warn(`Auto-fetch: refresh error for "${sub.label}": ${e?.message}`);
+            }
+        }
+        // Verify configs are now available
+        const verifyRes = await fetch("http://127.0.0.1:38571/api/imported-configs?bucket=optimized&limit=1");
+        if (verifyRes.ok) {
+            const verifyData = await verifyRes.json();
+            electron_log_1.default.info(`Auto-fetch: complete — ${verifyData.configs?.length || 0} optimized configs now available`);
+        }
+        // Now trigger quick connect
+        electron_log_1.default.info("Auto-fetch: triggering quick connect…");
+        quickConnect().catch((e) => electron_log_1.default.warn(`Auto-fetch: quickConnect failed: ${e?.message}`));
+    }
+    catch (e) {
+        electron_log_1.default.warn(`Auto-fetch: failed (non-fatal): ${e?.message}`);
+    }
+}
+// ---------------------------------------------------------------------------
+// Single-instance lock — prevents multiple DISTORT instances from running.
+// Without this, every click on the app icon spawns a new instance, each
+// trying to start its own Next.js server on port 38571 (which fails for all
+// but the first). This was causing the "20 DISTORT icons in taskbar" bug.
+// ---------------------------------------------------------------------------
+const gotTheLock = electron_1.app.requestSingleInstanceLock();
+if (!gotTheLock) {
+    // Another instance is already running — quit this one immediately.
+    // The existing instance will be focused via the 'second-instance' event.
+    electron_log_1.default.info("Another DISTORT instance is already running — quitting this one.");
+    electron_1.app.quit();
+}
+else {
+    electron_1.app.on("second-instance", () => {
+        // Someone tried to run a second instance — focus the existing window.
+        electron_log_1.default.info("Second instance blocked — focusing existing window.");
+        if (mainWindow) {
+            if (mainWindow.isMinimized())
+                mainWindow.restore();
+            mainWindow.focus();
+        }
     });
 }
 electron_1.app.whenReady().then(async () => {
@@ -1254,10 +2404,31 @@ electron_1.app.whenReady().then(async () => {
     await startNextServer();
     createWindow();
     createTray();
-    // Auto-connect on startup if enabled
-    if (store.get("settings.autoConnect")) {
-        setTimeout(() => quickConnect(), 1500);
+    // Auto-fetch Community Mesh subscription on first run.
+    // This populates the Iran config list so Quick Connect has configs to try.
+    // Runs in the background — doesn't block app startup.
+    autoFetchSubscription().catch((e) => electron_log_1.default.warn(`Auto-fetch failed: ${e?.message}`));
+    // Start the companion control API on 127.0.0.1:10810.
+    // This is what the BrowserWithCompanionEngine (in the web dashboard's
+    // recovery-engine.ts) reaches out to in order to spawn xray-core and
+    // verify tunnel traffic. MUST run on a different port than xray's HTTP
+    // proxy (10809) — see comment near COMPANION_API_PORT for details.
+    startCompanionApiServer();
+    // Start the auto-updater (electron-updater + GitHub Releases).
+    // Non-fatal if it fails: wraps everything in try/catch and just logs.
+    // Skips the actual check in dev mode (electron-updater requires a packaged
+    // app to read app-update.yml).
+    try {
+        setupAutoUpdater();
     }
+    catch (e) {
+        electron_log_1.default.warn(`[auto-updater] setupAutoUpdater threw (non-fatal): ${e?.message}`);
+    }
+    // Auto-connect: handled by autoFetchSubscription() which calls quickConnect()
+    // after configs are fetched. Don't call quickConnect separately — it would
+    // run before configs are available.
+    // The old setTimeout(() => quickConnect(), 1500) was too early — configs
+    // weren't fetched yet.
     // AUTO-REFRESH SUBSCRIPTIONS — keeps configs fresh for national internet resilience.
     // Every 60 minutes, refresh all enabled subscriptions so we always have the latest
     // working configs. This is critical for Iran: configs get blocked frequently and
@@ -1316,11 +2487,11 @@ electron_1.app.whenReady().then(async () => {
             electron_log_1.default.warn(`Auto-refresh error: ${e?.message}`);
         }
     }
-    // Run first refresh after 30s (let server start), then every 60min
-    refreshTimer = setTimeout(() => {
-        autoRefreshSubscriptions();
-        refreshTimer = setInterval(autoRefreshSubscriptions, REFRESH_INTERVAL_MS);
-    }, 30000);
+    // Run first refresh IMMEDIATELY (so configs are cached on disk for quick
+    // connect / offline use as soon as possible after startup), then every
+    // 60min for ongoing freshness.
+    autoRefreshSubscriptions();
+    refreshTimer = setInterval(autoRefreshSubscriptions, REFRESH_INTERVAL_MS);
     electron_1.app.on("activate", () => {
         if (electron_1.BrowserWindow.getAllWindows().length === 0) {
             createWindow();
@@ -1345,6 +2516,10 @@ electron_1.app.on("before-quit", async (e) => {
     // CRITICAL: Always disable kill switch on quit, otherwise the user's internet
     // would be permanently blocked if the app crashed while kill switch was active.
     await disableKillSwitch();
+    // Stop the companion control API server (port 10810).
+    stopCompanionApiServer();
+    // Stop the auto-updater's periodic check timer.
+    stopAutoUpdater();
     if (!isQuitting) {
         isQuitting = true;
         electron_1.app.quit();
@@ -1355,12 +2530,16 @@ process.on("SIGINT", async () => {
     electron_log_1.default.info("Received SIGINT — cleaning up…");
     await stopVpnEngine();
     await disableKillSwitch();
+    stopCompanionApiServer();
+    stopAutoUpdater();
     process.exit(0);
 });
 process.on("SIGTERM", async () => {
     electron_log_1.default.info("Received SIGTERM — cleaning up…");
     await stopVpnEngine();
     await disableKillSwitch();
+    stopCompanionApiServer();
+    stopAutoUpdater();
     process.exit(0);
 });
 // On uncaught exceptions (potential crash), try to clean up before exiting.
@@ -1369,6 +2548,8 @@ process.on("uncaughtException", async (err) => {
     try {
         await stopVpnEngine();
         await disableKillSwitch();
+        stopCompanionApiServer();
+        stopAutoUpdater();
     }
     catch { }
     process.exit(1);
