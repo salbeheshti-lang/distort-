@@ -428,10 +428,15 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   if (!server) throw new Error("No server selected");
   log.info(`Starting xray-core: ${protocol} to ${server.host}:${server.port}`);
 
-  // Stop any existing xray process
+  // Stop any existing xray process AND wait for ports to be released.
+  // FIX (v1.0.38 review): previously this only called kill("SIGTERM") + set
+  // vpnProcess=null without waiting. If a new xray spawned immediately, it
+  // could hit EADDRINUSE on ports 10808/10809 because the OS hadn't freed
+  // them yet. Now we delegate to stopVpnEngine() which does SIGTERM → 500ms
+  // wait → SIGKILL → 500ms wait → log "ports released".
   if (vpnProcess) {
-    try { vpnProcess.kill("SIGTERM"); } catch {}
-    vpnProcess = null;
+    log.info("[startVpnEngine] existing xray process found — stopping it before spawning new one");
+    await stopVpnEngine();
   }
 
   // Build the REAL config (uses real credentials from configUri, or throws)
@@ -741,6 +746,15 @@ const HEALTH_CHECK_INTERVAL_MS = 30_000; // 30 seconds
 // any in-flight verification from a stopped tunnel is invalidated.
 // ---------------------------------------------------------------------------
 let currentVerifyAttempt = 0;
+
+// ---------------------------------------------------------------------------
+// Quick Connect mutex (v1.0.38 review — Q6: prevent concurrent quickConnect).
+// If the user clicks Quick Connect twice (or auto-connect fires while a
+// manual connect is already running), the second call MUST be a no-op,
+// otherwise two xray processes could spawn simultaneously and fight over
+// ports 10808/10809.
+// ---------------------------------------------------------------------------
+let quickConnectRunning = false;
 
 // Tunnel health monitoring — checks every 30s if the tunnel is still alive.
 // If the tunnel dies:
@@ -1659,6 +1673,15 @@ async function tryQuickConnectTier(
 }
 
 async function quickConnect(): Promise<void> {
+  // Mutex: prevent concurrent quickConnect runs (Q6 — two xray processes
+  // fighting over ports 10808/10809). If a connect is already in progress,
+  // log + return immediately. The user's UI click is already reflected in
+  // the "connecting" state sent by tryQuickConnectTier.
+  if (quickConnectRunning) {
+    log.warn("Quick connect: already running — ignoring duplicate call");
+    return;
+  }
+  quickConnectRunning = true;
   try {
     checkFreeEngineFreshness();
     const attemptedUris = new Set<string>();
@@ -1722,6 +1745,8 @@ async function quickConnect(): Promise<void> {
   } catch (e: any) {
     log.error("Quick connect failed:", e?.message || e);
     mainWindow?.webContents.send("vpn:error", `Quick connect failed: ${e?.message || "unknown error"}`);
+  } finally {
+    quickConnectRunning = false;
   }
 }
 
