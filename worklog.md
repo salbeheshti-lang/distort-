@@ -1201,3 +1201,69 @@ Stage Summary:
   - Test the full connect flow against a real xray companion (the user's desktop app) — should now correctly connect to the auto-selected best config or any user-picked one.
   - Consider adding a "Stop testing" cancel button if Test all is taking too long (currently the only way to cancel is to wait for the server response — typically 3s for 50 configs).
   - The personal-config star badge uses fill-[#ffb020] (yellow). If the maintainer wants a different visual treatment (e.g. a "Personal" text badge instead of an icon), it's a one-line change in connect-view.tsx at the dropdown render block (lines ~754-762).
+
+---
+Task ID: V1.0.34-XRAY-FIX
+Agent: main (orchestrator)
+Task: Fix xray exit — pre-flight validation + stderr capture + TUN inbound fix + Connect page redesign
+
+Work Log:
+- Phase 1 (Connect UI redesign — delegated to full-stack-developer subagent):
+  - Removed "Distort Config" tab from sidebar (was redundant — configs already in Connect dropdown)
+  - Deleted community-mesh-view.tsx entirely (733 lines removed)
+  - Extracted ImportDialog into src/components/vpn/import-config-dialog.tsx (227 lines)
+  - Redesigned connect-view.tsx (453 → 1010 lines):
+    - Broader fetch: /api/imported-configs?limit=80 (was limit=10)
+    - Latency state + "Test all" button (calls POST /api/imported-configs/check)
+    - LatencyBadge component: green/yellow/red/gray based on ms
+    - "+ Import" button with brand gradient (opens ImportDialog)
+    - Personal configs (favorite=true or subscription.kind="manual") marked with ⭐
+    - 4-tier sort: personal first, then by latency asc, then untested, then unreachable
+    - Auto-select best reachable config after Test all (if user hasn't manually selected)
+  - Verified via agent-browser: 5 screenshots saved, all checks pass
+
+- Phase 2 (xray parser fix — done by main orchestrator):
+  - Identified root cause of "xray process exited immediately":
+    - The companion API path (buildXrayConfigFromUri) passes tun:false, so TUN inbound is NOT used
+    - The REAL problem was: no pre-flight validation + no stderr capture
+    - xray was crashing and the user only saw "check config validity or xray binary" — no actual error
+  - Fix 1: Pre-flight validation (desktop/src/main.ts lines 1573-1616):
+    - Run `xray run -test -c config.json` before the real spawn
+    - This validates the config WITHOUT starting the tunnel
+    - If validation fails, extract the actual xray error from stderr and return it to the UI
+    - 10s manual timeout via setTimeout (spawn() has no timeout option in Node types)
+  - Fix 2: Stderr capture (desktop/src/main.ts lines 1618-1666):
+    - Buffer xray's stderr lines (last 4KB) during the real spawn
+    - When xray exits within 2s, include the last 3 stderr lines in the error message
+    - Changed from "xray process exited immediately" → "xray crashed on startup: <actual error>"
+    - Increased wait from 500ms to 2000ms (xray needs 1-2s to init TUN+DNS+SOCKS)
+  - Fix 3: TUN inbound config (desktop/src/real-xray-config.ts):
+    - Fixed 3 bugs in the TUN inbound (used by desktop UI path, not companion API):
+      a) Removed `listen` field — TUN doesn't have a listen field
+      b) Changed `ip` to `address` with CIDR format `172.19.0.1/24`
+      c) Removed `excludeRoutes` with hostname — was causing parse errors
+    - Removed `mux:{enabled:false}` for non-WS — omit mux entirely when not needed
+
+- Release v1.0.34:
+  - Bumped desktop/package.json version 1.0.33 → 1.0.34
+  - Committed + pushed to main + tagged v1.0.34
+  - CI build completed: success
+  - Draft release published (set draft=false, make_latest=true)
+  - latest.yml verified: version 1.0.34, sha512, size 222MB
+  - Release URL: https://github.com/salbeheshti-lang/distort-/releases/tag/v1.0.34
+
+Stage Summary:
+- v1.0.34 released with TWO major improvements:
+  1. UI: Distort Config tab removed; Connect page is now the single hub with import + ping + test-all
+  2. Backend: xray spawn now has pre-flight validation + stderr capture — the user will see the ACTUAL xray error message instead of "xray process exited immediately"
+- Honest limitations:
+  - The pre-flight validation catches config FORMAT errors (invalid fields, bad JSON structure)
+  - It does NOT catch RUNTIME errors (port conflicts, admin elevation, network issues)
+  - The stderr capture handles runtime errors — the last 3 stderr lines are included in the error message
+  - The TUN inbound fix only affects the desktop UI path (which uses tun:true); the companion API path (which the web dashboard uses) already had tun:false
+  - NOT runtime-tested against a real xray binary (sandbox has no Windows/GUI) — the fix is based on code analysis + xray-core docs
+  - The user needs to update to v1.0.34 and test — if xray still crashes, the new error message will tell us WHY
+- Next actions for the maintainer:
+  1. Update to v1.0.34 (auto-updater will prompt, or click "Check updates")
+  2. Try connecting — if it fails, the toast will now show the ACTUAL xray error
+  3. Send me the error message — I can then fix the specific issue
