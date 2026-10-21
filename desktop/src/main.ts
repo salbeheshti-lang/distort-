@@ -1547,15 +1547,15 @@ async function tryQuickConnectTier(
 ): Promise<boolean> {
   if (configs.length === 0) return false;
 
-  log.info(\`Quick connect: testing \${configs.length} configs from \${configs[0]?.source || "unknown source"}\`);
+  log.info(`Quick connect: testing ${configs.length} configs from ${configs[0]?.source || "unknown source"}`);
 
   for (let i = 0; i < configs.length; i++) {
     const cfg = configs[i];
-    const attemptKey = cfg.uri || \`\${cfg.protocol}://\${cfg.host}:\${cfg.port}\`;
+    const attemptKey = cfg.uri || `${cfg.protocol}://${cfg.host}:${cfg.port}`;
     if (attemptedUris.has(attemptKey)) continue;
     attemptedUris.add(attemptKey);
 
-    log.info(\`Quick connect: attempt \${attemptedUris.size} — \${cfg.protocol} \${cfg.host}:\${cfg.port} (src=\${cfg.source})\`);
+    log.info(`Quick connect: attempt ${attemptedUris.size} — ${cfg.protocol} ${cfg.host}:${cfg.port} (src=${cfg.source})`);
 
     // A TCP handshake is only a cheap pre-check; successful VPN state below is
     // still required. Some public configs may have become unreachable since
@@ -1579,12 +1579,12 @@ async function tryQuickConnectTier(
         socket.connect(cfg.port, cfg.host);
       });
       if (!probeResult.ok) {
-        log.warn(\`Quick connect: \${cfg.host}:\${cfg.port} TCP pre-check failed; trying next config\`);
+        log.warn(`Quick connect: ${cfg.host}:${cfg.port} TCP pre-check failed; trying next config`);
         continue;
       }
-      log.info(\`Quick connect: \${cfg.host}:\${cfg.port} TCP reachable (\${probeResult.latency}ms)\`);
+      log.info(`Quick connect: ${cfg.host}:${cfg.port} TCP reachable (${probeResult.latency}ms)`);
     } catch (e: any) {
-      log.warn(\`Quick connect: TCP pre-check error for \${cfg.host}:\${cfg.port}: \${e?.message}; trying next\`);
+      log.warn(`Quick connect: TCP pre-check error for ${cfg.host}:${cfg.port}: ${e?.message}; trying next`);
       continue;
     }
 
@@ -1612,7 +1612,7 @@ async function tryQuickConnectTier(
       const vpnState = store.get("vpn");
 
       if (vpnState.connected) {
-        log.info(\`Quick connect: SUCCESS — \${cfg.host} via \${cfg.source}\`);
+        log.info(`Quick connect: SUCCESS — ${cfg.host} via ${cfg.source}`);
 
         try {
           const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
@@ -1633,10 +1633,10 @@ async function tryQuickConnectTier(
         return true;
       }
 
-      log.warn(\`Quick connect: Xray did not verify a tunnel through \${cfg.host}; trying next\`);
+      log.warn(`Quick connect: Xray did not verify a tunnel through ${cfg.host}; trying next`);
       await stopVpnEngine();
     } catch (e: any) {
-      log.warn(\`Quick connect: Xray failed for \${cfg.host}:\${cfg.port}: \${e?.message}; trying next\`);
+      log.warn(`Quick connect: Xray failed for ${cfg.host}:${cfg.port}: ${e?.message}; trying next`);
       await stopVpnEngine().catch(() => {});
     }
   }
@@ -1697,7 +1697,7 @@ async function quickConnect(): Promise<void> {
         }
       }
     } catch (e: any) {
-      log.warn(\`Quick connect: last-working config fallback failed: \${e?.message}\`);
+      log.warn(`Quick connect: last-working config fallback failed: ${e?.message}`);
     }
 
     log.error("Quick connect: ALL sources and configs failed — cannot connect");
@@ -1707,7 +1707,7 @@ async function quickConnect(): Promise<void> {
     );
   } catch (e: any) {
     log.error("Quick connect failed:", e?.message || e);
-    mainWindow?.webContents.send("vpn:error", \`Quick connect failed: \${e?.message || "unknown error"}\`);
+    mainWindow?.webContents.send("vpn:error", `Quick connect failed: ${e?.message || "unknown error"}`);
   }
 }
 
