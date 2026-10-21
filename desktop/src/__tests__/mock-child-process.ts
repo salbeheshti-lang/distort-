@@ -37,18 +37,57 @@ export class MockChildProcess extends EventEmitter {
   public killShouldThrow: boolean = false;
 
   /**
+   * Internal resolvers for each signal. When kill(signal) is called,
+   * the corresponding resolver is set so the test can await it.
+   * This eliminates the need for setTimeout(r, 30) to "wait for SIGTERM delivery".
+   */
+  private signalResolvers: Map<string, () => void> = new Map();
+
+  /**
    * Simulates sending a signal to the process. Records the signal.
    * Sets `killed = true` (matches Node ChildProcess behavior — kill() sets
    * killed=true even if the process hasn't exited yet).
    * Does NOT cause 'exit' to fire — the test must call emitExit() explicitly.
+   *
+   * After kill() returns, the test can `await mock.waitForSignal("SIGTERM")`
+   * to deterministically know the signal was received.
    */
   kill(signal?: string): boolean {
+    const sig = signal || "SIGTERM";
     if (this.killShouldThrow) {
-      throw new Error(`EPERM: kill ${signal} failed`);
+      throw new Error(`EPERM: kill ${sig} failed`);
     }
-    this.signalsReceived.push(signal || "SIGTERM");
+    this.signalsReceived.push(sig);
     this.killed = true;
+    // Resolve any pending waitForSignal for this signal.
+    const resolver = this.signalResolvers.get(sig);
+    if (resolver) {
+      this.signalResolvers.delete(sig);
+      // Schedule on next microtask so kill() returns first.
+      Promise.resolve().then(() => resolver());
+    }
     return true;
+  }
+
+  /**
+   * Returns a Promise that resolves when kill(signal) is called with the
+   * given signal. This lets tests deterministically wait for signal delivery
+   * WITHOUT setTimeout.
+   *
+   * Usage:
+   *   const sigtermPromise = mock.waitForSignal("SIGTERM");
+   *   // ... start stopXrayProcess ...
+   *   await sigtermPromise;  // SIGTERM has been sent
+   *   mock.emitExit(0);      // now simulate exit
+   */
+  waitForSignal(signal: string): Promise<void> {
+    // If the signal was already received, resolve immediately.
+    if (this.signalsReceived.includes(signal)) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.signalResolvers.set(signal, resolve);
+    });
   }
 
   /**

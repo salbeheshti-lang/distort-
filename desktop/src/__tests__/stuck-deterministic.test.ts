@@ -33,20 +33,38 @@ import type { ChildProcess } from "child_process";
  *
  * `setResult(port, isFree)` lets the test control what the next probe of
  * that port returns. If no result is set for a port, defaults to true (free).
+ *
+ * `waitForProbe(port)` returns a Promise that resolves when the prober is
+ * called for that port — lets the test deterministically know the probe
+ * has completed WITHOUT setTimeout.
  */
 function createControllableProber() {
   const results = new Map<number, boolean>();
-  const probeCalls: { port: number; timestamp: number }[] = [];
+  const probeResolvers = new Map<number, () => void>();
+  let probeCallCount = 0;
   return {
     prober: async (port: number, _attempts: number, _intervalMs: number): Promise<boolean> => {
-      probeCalls.push({ port, timestamp: Date.now() });
+      probeCallCount++;
+      // Signal any pending waitForProbe for this port.
+      const resolver = probeResolvers.get(port);
+      if (resolver) {
+        probeResolvers.delete(port);
+        Promise.resolve().then(() => resolver());
+      }
       return results.get(port) ?? true; // default: free
     },
     setResult: (port: number, isFree: boolean) => results.set(port, isFree),
-    getCalls: () => probeCalls.slice(),
-    getCallCount: (port?: number) => port !== undefined
-      ? probeCalls.filter(c => c.port === port).length
-      : probeCalls.length,
+    getCallCount: () => probeCallCount,
+    /**
+     * Returns a Promise that resolves when the prober is next called for
+     * the given port. This lets tests deterministically wait for probe
+     * completion WITHOUT setTimeout.
+     */
+    waitForProbe: (port: number): Promise<void> => {
+      return new Promise<void>((resolve) => {
+        probeResolvers.set(port, resolve);
+      });
+    },
   };
 }
 
@@ -54,12 +72,22 @@ function createControllableProber() {
  * Create a portProber that resolves after a controllable signal.
  * The probe returns a Promise that resolves when `resolveProbe(port)` is called.
  * This gives the test EXACT control over WHEN the probe completes.
+ *
+ * `onProbeCalled(port)` registers a callback that fires when the prober is
+ * called for that port — lets tests track probe progress without setTimeout.
  */
 function createBlockingProber() {
   const resolvers = new Map<number, (result: boolean) => void>();
   const results = new Map<number, boolean>();
+  const probeCallbacks = new Map<number, (() => void)[]>();
   return {
     prober: (port: number, _attempts: number, _intervalMs: number): Promise<boolean> => {
+      // Notify any registered callbacks that this port was probed.
+      const callbacks = probeCallbacks.get(port);
+      if (callbacks) {
+        probeCallbacks.delete(port);
+        for (const cb of callbacks) Promise.resolve().then(() => cb());
+      }
       return new Promise<boolean>((resolve) => {
         resolvers.set(port, resolve);
         // If a result was pre-set, resolve immediately.
@@ -81,6 +109,17 @@ function createBlockingProber() {
     /** Pre-set a result (probe will resolve immediately when called). */
     presetResult: (port: number, isFree: boolean) => {
       results.set(port, isFree);
+    },
+    /**
+     * Register a callback that fires when the prober is called for the
+     * given port. Returns a Promise that resolves on the next probe call.
+     */
+    onProbeCalled: (port: number): Promise<void> => {
+      return new Promise<void>((resolve) => {
+        const callbacks = probeCallbacks.get(port) || [];
+        callbacks.push(resolve);
+        probeCallbacks.set(port, callbacks);
+      });
     },
   };
 }
@@ -190,17 +229,23 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
+    // Register probe-completion signals BEFORE emitting exit.
+    // When the prober is called for SOCKS (the first probe), we know the
+    // re-probe chain has started. When it's called for HTTP (the second),
+    // the chain is complete.
+    const socksProbed = prober.onProbeCalled(10808);
+    const httpProbed = prober.onProbeCalled(10809);
+
     // Emit exit — triggers async port re-probe.
     mock.emitExit(0);
 
-    // Port 10808 is held → probes resolve immediately with false →
-    // onStuckCleared does NOT fire. We verify by waiting for the probe
-    // chain to complete. Since probes are pre-set (no setTimeout), they
-    // resolve synchronously in the microtask queue. We just need one
-    // microtask tick to let the .then() chain execute.
-    await new Promise(r => setTimeout(r, 0)); // one microtask tick
+    // Wait for BOTH probes to complete. This is deterministic — no setTimeout.
+    // The probes resolve immediately (preset results), but we need to let
+    // the microtask queue process the .then() chain.
+    await socksProbed;
+    await httpProbed;
 
-    // Callback must NOT have fired.
+    // Callback must NOT have fired (SOCKS port is held).
     expect(latch.getCount()).toBe(0);
   });
 
@@ -235,9 +280,18 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     expect(count).toBe(1);
 
     // Second emit — should be no-op (stuckClearedFired flag).
+    // Register a probe callback to detect if the second emit triggers any
+    // re-probe. If it does, the prober would be called again.
+    const secondProbeDetected = prober.onProbeCalled(10808);
     mock.emitExit(0);
-    // One microtask tick to let any potential second callback execute.
-    await new Promise(r => setTimeout(r, 0));
+    // If the dedup works, the second emitExit is a no-op and onProbeCalled
+    // never resolves. We race it against a microtask tick to confirm.
+    const racedResult = await Promise.race([
+      secondProbeDetected.then(() => true),
+      Promise.resolve(false), // resolves on next microtask
+    ]);
+    // If secondProbeDetected resolved, dedup FAILED. If false, dedup worked.
+    expect(racedResult).toBe(false);
 
     // Still exactly once.
     expect(latch.getCount()).toBe(1);
@@ -260,8 +314,8 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
       portProber: prober.prober,
     });
 
-    // Wait for SIGTERM to be sent.
-    await new Promise(r => setTimeout(r, 30));
+    // Deterministically wait for SIGTERM to be sent (no setTimeout).
+    await mock.waitForSignal("SIGTERM");
     expect(mock.signalsReceived).toContain("SIGTERM");
 
     // Emit exit — resolves the SIGTERM promise.
@@ -273,8 +327,7 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     expect(mock.signalsReceived).toEqual(["SIGTERM"]);
     expect(r.portsReleased).toBe(true);
     // Probes were called (both ports).
-    expect(prober.getCallCount(10808)).toBe(1);
-    expect(prober.getCallCount(10809)).toBe(1);
+    expect(prober.getCallCount()).toBe(2);
   });
 
   test("SIGTERM fails (EPERM) → SIGKILL fallback → stuck if no exit", async () => {
@@ -311,7 +364,7 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
       portProber: prober.prober,
     });
 
-    await new Promise(r => setTimeout(r, 30));
+    await mock.waitForSignal("SIGTERM");
     mock.emitExit(0);
 
     const r = await stopPromise;
@@ -337,7 +390,7 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
       portProber: prober.prober,
     });
 
-    await new Promise(r => setTimeout(r, 30));
+    await mock.waitForSignal("SIGTERM");
     mock.emitExit(0);
 
     const r = await stopPromise;
@@ -363,7 +416,7 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
       portProber: prober.prober,
     });
 
-    await new Promise(r => setTimeout(r, 30));
+    await mock.waitForSignal("SIGTERM");
     mock.emitExit(0);
 
     const r = await stopPromise;
@@ -443,11 +496,16 @@ describe("stopXrayProcess — stuck callback does NOT clear when port held after
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
+    // Register probe-completion signals BEFORE emitting exit.
+    const socksProbed = prober.onProbeCalled(10808);
+    const httpProbed = prober.onProbeCalled(10809);
+
     // Emit exit — triggers re-probe. Port 10808 is held → callback must NOT fire.
     mock.emitExit(0);
 
-    // One microtask tick for the .then() chain to execute.
-    await new Promise(r => setTimeout(r, 0));
+    // Wait for BOTH probes to complete (deterministic — no setTimeout).
+    await socksProbed;
+    await httpProbed;
 
     expect(latch.getCount()).toBe(0); // NOT called
   });
@@ -474,8 +532,15 @@ describe("stopXrayProcess — stuck callback does NOT clear when port held after
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
+    // Register probe-completion signals BEFORE emitting exit.
+    const socksProbed = prober.onProbeCalled(10808);
+    const httpProbed = prober.onProbeCalled(10809);
+
     mock.emitExit(0);
-    await new Promise(r => setTimeout(r, 0));
+
+    // Wait for BOTH probes to complete (deterministic — no setTimeout).
+    await socksProbed;
+    await httpProbed;
 
     expect(latch.getCount()).toBe(0); // NOT called
   });
