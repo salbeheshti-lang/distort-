@@ -69,31 +69,79 @@ function createControllableProber() {
 }
 
 /**
- * Create a portProber that resolves after a controllable signal.
- * The probe returns a Promise that resolves when `resolveProbe(port)` is called.
- * This gives the test EXACT control over WHEN the probe completes.
+ * Create a portProber with controllable probe results + completion tracking.
  *
- * `onProbeCalled(port)` registers a callback that fires when the prober is
- * called for that port — lets tests track probe progress without setTimeout.
+ * KEY FEATURE: `onProbeSettled(port)` returns a Promise that resolves AFTER
+ * the probe Promise settles AND the subsequent `.then()` handler in
+ * stopXrayProcess has finished executing. This is different from
+ * `onProbeCalled` which only fires when the prober function is ENTERED.
+ *
+ * How it works:
+ *   1. stopXrayProcess calls doPortProbe(socksPort, ...) → prober is entered
+ *   2. prober returns a Promise<boolean>
+ *   3. stopXrayProcess chains .then(socksFree => doPortProbe(httpPort, ...))
+ *   4. When the SOCKS probe resolves, the .then() handler runs
+ *   5. Inside the .then(), the HTTP probe is called
+ *   6. When BOTH probes settle + the final .then() runs, the callback
+ *      decision is made
+ *
+ * `onProbeSettled(port)` resolves at step 2 (when the Promise settles),
+ * NOT at step 4. To wait for the FULL chain, use `onProbeChainComplete()`.
+ *
+ * `onProbeChainComplete()` resolves when BOTH probes have settled AND the
+ * final .then() decision has been made (callback called or not). This is
+ * tracked by having the prober return a Promise that, when settled,
+ * triggers a microtask that checks if both ports have been probed.
  */
 function createBlockingProber() {
   const resolvers = new Map<number, (result: boolean) => void>();
   const results = new Map<number, boolean>();
-  const probeCallbacks = new Map<number, (() => void)[]>();
+  const probeCalledCallbacks = new Map<number, (() => void)[]>();
+  const probeSettledCallbacks = new Map<number, (() => void)[]>();
+  const probeResults = new Map<number, boolean>();
+  let probeCount = 0;
+  let chainCompleteResolve: (() => void) | null = null;
+  let chainCompletePromise: Promise<void> | null = null;
+
+  function notifySettled(port: number) {
+    const settled = probeSettledCallbacks.get(port);
+    if (settled) {
+      probeSettledCallbacks.delete(port);
+      for (const cb of settled) cb();
+    }
+    // Check if both ports have settled → chain complete
+    if (probeResults.size >= 2 && chainCompleteResolve) {
+      const r = chainCompleteResolve;
+      chainCompleteResolve = null;
+      chainCompletePromise = null;
+      // Schedule on next microtask so the .then() chain finishes first
+      Promise.resolve().then(() => r());
+    }
+  }
+
   return {
     prober: (port: number, _attempts: number, _intervalMs: number): Promise<boolean> => {
-      // Notify any registered callbacks that this port was probed.
-      const callbacks = probeCallbacks.get(port);
-      if (callbacks) {
-        probeCallbacks.delete(port);
-        for (const cb of callbacks) Promise.resolve().then(() => cb());
+      probeCount++;
+      // Notify onProbeCalled listeners
+      const called = probeCalledCallbacks.get(port);
+      if (called) {
+        probeCalledCallbacks.delete(port);
+        for (const cb of called) Promise.resolve().then(() => cb());
       }
       return new Promise<boolean>((resolve) => {
-        resolvers.set(port, resolve);
+        resolvers.set(port, (result: boolean) => {
+          probeResults.set(port, result);
+          // Notify settled listeners
+          Promise.resolve().then(() => notifySettled(port));
+          resolve(result);
+        });
         // If a result was pre-set, resolve immediately.
         if (results.has(port)) {
-          resolve(results.get(port)!);
+          const r = results.get(port)!;
+          probeResults.set(port, r);
           resolvers.delete(port);
+          Promise.resolve().then(() => notifySettled(port));
+          resolve(r);
         }
       });
     },
@@ -111,16 +159,53 @@ function createBlockingProber() {
       results.set(port, isFree);
     },
     /**
-     * Register a callback that fires when the prober is called for the
-     * given port. Returns a Promise that resolves on the next probe call.
+     * Resolves when the prober is ENTERED for the given port.
+     * Does NOT wait for the probe to settle or the .then() chain.
      */
     onProbeCalled: (port: number): Promise<void> => {
       return new Promise<void>((resolve) => {
-        const callbacks = probeCallbacks.get(port) || [];
+        const callbacks = probeCalledCallbacks.get(port) || [];
         callbacks.push(resolve);
-        probeCallbacks.set(port, callbacks);
+        probeCalledCallbacks.set(port, callbacks);
       });
     },
+    /**
+     * Resolves when the probe Promise for the given port SETTLES (resolves).
+     * Does NOT wait for the .then() chain to complete.
+     */
+    onProbeSettled: (port: number): Promise<void> => {
+      // If already settled, resolve immediately
+      if (probeResults.has(port)) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        const callbacks = probeSettledCallbacks.get(port) || [];
+        callbacks.push(resolve);
+        probeSettledCallbacks.set(port, callbacks);
+      });
+    },
+    /**
+     * Resolves when BOTH ports have been probed AND settled.
+     * After this resolves, the callback decision in stopXrayProcess's
+     * .then() chain has been made (or is about to be on the next microtask).
+     *
+     * This is the correct signal for asserting callback count — it
+     * guarantees the FULL probe chain has completed.
+     */
+    onProbeChainComplete: (): Promise<void> => {
+      if (probeResults.size >= 2) return Promise.resolve();
+      if (chainCompletePromise) return chainCompletePromise;
+      chainCompletePromise = new Promise<void>((resolve) => {
+        chainCompleteResolve = resolve;
+      });
+      return chainCompletePromise;
+    },
+    /** Reset state for reuse (between tests). */
+    reset: () => {
+      probeResults.clear();
+      probeCount = 0;
+      chainCompleteResolve = null;
+      chainCompletePromise = null;
+    },
+    getProbeCount: () => probeCount,
   };
 }
 
@@ -229,21 +314,17 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
-    // Register probe-completion signals BEFORE emitting exit.
-    // When the prober is called for SOCKS (the first probe), we know the
-    // re-probe chain has started. When it's called for HTTP (the second),
-    // the chain is complete.
-    const socksProbed = prober.onProbeCalled(10808);
-    const httpProbed = prober.onProbeCalled(10809);
+    // Register the chain-complete signal BEFORE emitting exit.
+    // onProbeChainComplete resolves when BOTH probes have settled AND the
+    // .then() decision (callback call or skip) has been made.
+    const chainComplete = prober.onProbeChainComplete();
 
     // Emit exit — triggers async port re-probe.
     mock.emitExit(0);
 
-    // Wait for BOTH probes to complete. This is deterministic — no setTimeout.
-    // The probes resolve immediately (preset results), but we need to let
-    // the microtask queue process the .then() chain.
-    await socksProbed;
-    await httpProbed;
+    // Wait for the FULL probe chain to complete — not just probe entry,
+    // but probe settle + .then() decision. This is deterministic.
+    await chainComplete;
 
     // Callback must NOT have fired (SOCKS port is held).
     expect(latch.getCount()).toBe(0);
@@ -271,29 +352,56 @@ describe("stopXrayProcess — DETERMINISTIC stuck logic (injectable portProber)"
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
-    // Start waiting BEFORE emitting exit.
+    // Register the chain-complete signal BEFORE first emit.
+    const firstChain = prober.onProbeChainComplete();
+
+    // Start waiting for callback BEFORE emitting exit.
     const countPromise = latch.waitForCallback();
 
-    // First emit — should trigger callback.
+    // First emit — should trigger probe chain + callback.
     mock.emitExit(0);
+
+    // Wait for the FULL probe chain to complete.
+    await firstChain;
     const count = await countPromise;
     expect(count).toBe(1);
+    // Verify exactly 2 probes ran (one per port).
+    expect(prober.getProbeCount()).toBe(2);
+
+    // Reset the prober's tracking state so the second chain-complete
+    // signal starts fresh. Without reset, probeResults.size >= 2 from
+    // the first chain would make onProbeChainComplete resolve immediately.
+    prober.reset();
+    // Re-preset the results so if a second probe DOES run (dedup failed),
+    // it has results to return.
+    prober.presetResult(10808, true);
+    prober.presetResult(10809, true);
+
+    // Now register a SECOND chain-complete signal.
+    // If the second emitExit triggers a probe chain, this will resolve.
+    // If dedup works (stuckClearedFired=true), it never resolves.
+    const secondChain = prober.onProbeChainComplete();
+    const probeCountBefore = prober.getProbeCount();
 
     // Second emit — should be no-op (stuckClearedFired flag).
-    // Register a probe callback to detect if the second emit triggers any
-    // re-probe. If it does, the prober would be called again.
-    const secondProbeDetected = prober.onProbeCalled(10808);
     mock.emitExit(0);
-    // If the dedup works, the second emitExit is a no-op and onProbeCalled
-    // never resolves. We race it against a microtask tick to confirm.
-    const racedResult = await Promise.race([
-      secondProbeDetected.then(() => true),
-      Promise.resolve(false), // resolves on next microtask
-    ]);
-    // If secondProbeDetected resolved, dedup FAILED. If false, dedup worked.
-    expect(racedResult).toBe(false);
 
-    // Still exactly once.
+    // Wait for the chain-complete signal. If dedup works, this NEVER resolves.
+    // We use a real 2s timeout to detect a hang (NOT for assertion timing —
+    // only to prevent the test from hanging forever if dedup is broken).
+    const secondChainResult = await Promise.race([
+      secondChain.then(() => "resolved"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 2000)),
+    ]);
+
+    // If secondChain resolved, dedup FAILED — a second probe chain ran.
+    // If "timeout", dedup worked — no second probe was triggered.
+    expect(secondChainResult).toBe("timeout");
+
+    // Probe count must NOT have increased (no second probe chain).
+    expect(prober.getProbeCount()).toBe(probeCountBefore);
+
+    // Callback still exactly once.
     expect(latch.getCount()).toBe(1);
   });
 
@@ -496,16 +604,14 @@ describe("stopXrayProcess — stuck callback does NOT clear when port held after
     const result = await stopPromise;
     expect(result.stuck).toBe(true);
 
-    // Register probe-completion signals BEFORE emitting exit.
-    const socksProbed = prober.onProbeCalled(10808);
-    const httpProbed = prober.onProbeCalled(10809);
+    // Register the chain-complete signal BEFORE emitting exit.
+    const chainComplete = prober.onProbeChainComplete();
 
     // Emit exit — triggers re-probe. Port 10808 is held → callback must NOT fire.
     mock.emitExit(0);
 
-    // Wait for BOTH probes to complete (deterministic — no setTimeout).
-    await socksProbed;
-    await httpProbed;
+    // Wait for the FULL probe chain to complete (deterministic — no setTimeout).
+    await chainComplete;
 
     expect(latch.getCount()).toBe(0); // NOT called
   });
@@ -551,5 +657,111 @@ describe("waitForPortReleased — real TCP (integration)", () => {
     // Use a high port that's almost certainly free.
     const result = await waitForPortReleased(19999, 1, 10);
     expect(result).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests for the createBlockingProber helper itself — verifies correct
+// behavior with concurrent waits, duplicate signals, and early calls.
+// ---------------------------------------------------------------------------
+
+describe("createBlockingProber — helper robustness tests", () => {
+  test("onProbeChainComplete resolves after both probes settle", async () => {
+    const prober = createBlockingProber();
+    // Don't preset results — use resolveProbe to control timing.
+
+    const chain = prober.onProbeChainComplete();
+
+    // Simulate first probe (SOCKS) — don't resolve yet.
+    const probe1 = prober.prober(10808, 1, 10);
+    // Chain should NOT be complete yet.
+    let chainResolved = false;
+    chain.then(() => { chainResolved = true; });
+    await new Promise(r => setTimeout(r, 10)); // let microtasks drain
+    expect(chainResolved).toBe(false);
+
+    // Resolve first probe.
+    prober.resolveProbe(10808, true);
+    await probe1;
+    await new Promise(r => setTimeout(r, 10));
+    // Chain still NOT complete — only one probe settled.
+    expect(chainResolved).toBe(false);
+
+    // Simulate second probe (HTTP) — resolve immediately.
+    prober.presetResult(10809, true);
+    const probe2 = prober.prober(10809, 1, 10);
+    await probe2;
+    await new Promise(r => setTimeout(r, 10));
+
+    // NOW chain should be complete.
+    expect(chainResolved).toBe(true);
+  });
+
+  test("multiple onProbeChainComplete calls all resolve", async () => {
+    const prober = createBlockingProber();
+    prober.presetResult(10808, true);
+    prober.presetResult(10809, true);
+
+    // Register 3 concurrent chain-complete waits.
+    const chain1 = prober.onProbeChainComplete();
+    const chain2 = prober.onProbeChainComplete();
+    const chain3 = prober.onProbeChainComplete();
+
+    let resolvedCount = 0;
+    chain1.then(() => resolvedCount++);
+    chain2.then(() => resolvedCount++);
+    chain3.then(() => resolvedCount++);
+
+    // Run both probes.
+    await prober.prober(10808, 1, 10);
+    await prober.prober(10809, 1, 10);
+    await new Promise(r => setTimeout(r, 10));
+
+    // All 3 should have resolved.
+    expect(resolvedCount).toBe(3);
+  });
+
+  test("onProbeChainComplete called after probes already settled resolves immediately", async () => {
+    const prober = createBlockingProber();
+    prober.presetResult(10808, true);
+    prober.presetResult(10809, true);
+
+    // Run both probes first.
+    await prober.prober(10808, 1, 10);
+    await prober.prober(10809, 1, 10);
+    await new Promise(r => setTimeout(r, 10));
+
+    // Now register chain-complete — should resolve immediately.
+    const chain = prober.onProbeChainComplete();
+    let resolved = false;
+    chain.then(() => { resolved = true; });
+    await new Promise(r => setTimeout(r, 10));
+    expect(resolved).toBe(true);
+  });
+
+  test("reset() clears state for reuse", async () => {
+    const prober = createBlockingProber();
+    prober.presetResult(10808, true);
+    prober.presetResult(10809, true);
+
+    // First cycle.
+    await prober.prober(10808, 1, 10);
+    await prober.prober(10809, 1, 10);
+    expect(prober.getProbeCount()).toBe(2);
+
+    // Reset.
+    prober.reset();
+    expect(prober.getProbeCount()).toBe(0);
+
+    // Second cycle should work fresh.
+    prober.presetResult(10808, false);
+    prober.presetResult(10809, true);
+    const chain = prober.onProbeChainComplete();
+    const r1 = await prober.prober(10808, 1, 10);
+    const r2 = await prober.prober(10809, 1, 10);
+    await chain;
+    expect(r1).toBe(false);
+    expect(r2).toBe(true);
+    expect(prober.getProbeCount()).toBe(2);
   });
 });
