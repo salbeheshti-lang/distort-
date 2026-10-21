@@ -107,46 +107,46 @@ describe("stopXrayProcess — production code (real import)", () => {
     cleanupScript(script);
   });
 
-  test("exit delayed beyond sigkillTimeout → didExit=false, stuck=true", async () => {
-    // HONEST LIMITATION: we can't make a process survive real SIGKILL.
-    // Instead, we test the LOGIC: if the 'exit' event doesn't fire within
-    // sigkillTimeoutMs, didExit stays false → stuck=true.
+  test("[integration] exit delayed beyond sigkillTimeout → logic test (timing-dependent)", async () => {
+    // HONEST LIMITATION: this test uses a real Node child process. On fast
+    // machines, SIGKILL may kill the process before our 50ms timeout fires,
+    // making didExit=true and stuck=false. This is NOT a code bug — it's a
+    // timing limitation of integration tests with real processes.
     //
-    // To simulate this, we use a process that ignores SIGTERM AND delays
-    // its voluntary exit beyond the sigkillTimeout. When stopXrayProcess
-    // sends SIGKILL, the kernel WILL kill it — but if our sigkillTimeoutMs
-    // is very short (e.g. 100ms) and the process takes longer than that to
-    // actually die (due to OS scheduling), didExit may be false at the
-    // decision point.
+    // The DETERMINISTIC version of this test is in stuck-deterministic.test.ts
+    // (uses MockChildProcess — no timing dependency).
     //
-    // This test is inherently flaky on fast machines (the process may exit
-    // before the timeout). We use a generous timeout to make it reliable.
+    // This integration test verifies the LOGIC: if didExit is false, stuck
+    // MUST be true. If the process exited quickly (didExit=true), we skip
+    // the stuck assertion (NOT a silent pass — we explicitly log it).
     const script = createMockScript({ ignoreSigterm: true });
     const proc = spawn("node", [script]);
-    await new Promise((r) => setTimeout(r, 100)); // let it start
+    await new Promise((r) => setTimeout(r, 100));
 
-    // Use a very short sigkillTimeout (50ms) so the exit event likely
-    // hasn't fired yet when we check didExit.
     const result = await stopXrayProcess(proc, {
       sigtermTimeoutMs: 100,
-      sigkillTimeoutMs: 50, // very short — exit event likely hasn't fired
+      sigkillTimeoutMs: 50,
       portProbeAttempts: 1,
       portProbeIntervalMs: 10,
     });
 
-    // On a fast machine, the process may have already exited. This test
-    // verifies the LOGIC: if didExit is false, stuck MUST be true.
-    if (!result.didExit) {
-      expect(result.stuck).toBe(true);
-      expect(result.portsReleased).toBe(false); // stuck → no port probe
-    } else {
-      // Process exited quickly — that's OK, the logic still works.
+    if (result.didExit) {
+      // Process exited before the timeout — expected on fast machines.
+      // The deterministic test in stuck-deterministic.test.ts covers the
+      // stuck=true scenario without timing dependency.
+      console.log("  [info] integration test: process exited before timeout (fast machine) — stuck assertion skipped");
       expect(result.stuck).toBe(false);
+    } else {
+      // Process did NOT exit in time — stuck MUST be true.
+      expect(result.stuck).toBe(true);
+      expect(result.portsReleased).toBe(false);
     }
     cleanupScript(script);
   });
 
-  test("stuck=true → onStuckCleared callback is registered (not called immediately)", async () => {
+  test("[integration] stuck callback timing (timing-dependent)", async () => {
+    // HONEST LIMITATION: this integration test depends on OS scheduling.
+    // The DETERMINISTIC version is in stuck-deterministic.test.ts.
     const script = createMockScript({ ignoreSigterm: true });
     const proc = spawn("node", [script]);
     await new Promise((r) => setTimeout(r, 100));
@@ -160,14 +160,13 @@ describe("stopXrayProcess — production code (real import)", () => {
       onStuckCleared: () => { stuckCleared = true; },
     });
 
-    // If stuck, the callback should NOT have been called yet (process hasn't
-    // emitted 'exit'). We verify this by checking immediately after.
     if (result.stuck) {
       expect(stuckCleared).toBe(false);
-      // Wait a bit for the process to actually die (SIGKILL always works
-      // eventually) — the callback should fire.
       await new Promise((r) => setTimeout(r, 500));
       expect(stuckCleared).toBe(true);
+    } else {
+      // Process exited before timeout — expected on fast machines.
+      console.log("  [info] integration test: process exited before timeout (fast machine) — callback timing skipped");
     }
     cleanupScript(script);
   });
@@ -279,13 +278,10 @@ describe("stopXrayProcess — production code (real import)", () => {
       });
 
       if (result.stuck) {
-        // The process is stuck. Wait for it to actually die (SIGKILL always
-        // works eventually). After exit, onStuckExit fires and re-probes ports.
         await new Promise((r) => setTimeout(r, 500));
-
-        // The external socksServer is still holding socksPort, so
-        // onStuckCleared must NOT have been called.
         expect(stuckCleared).toBe(false);
+      } else {
+        console.log("  [info] integration test: process exited before timeout (fast machine) — stuck assertion skipped");
       }
       cleanupScript(script);
     } finally {
@@ -316,9 +312,10 @@ describe("stopXrayProcess — production code (real import)", () => {
     });
 
     if (result.stuck) {
-      // Wait for exit + port re-probe.
       await new Promise((r) => setTimeout(r, 800));
       expect(stuckCleared).toBe(true);
+    } else {
+      console.log("  [info] integration test: process exited before timeout (fast machine) — stuck assertion skipped");
     }
     cleanupScript(script);
   });
@@ -429,12 +426,11 @@ describe("concurrent start/stop coordination (logic test)", () => {
     });
 
     if (result.stuck) {
-      // The callback should NOT have fired yet (process hasn't exited).
       expect(stuckClearedAt).toBeNull();
-      // Wait for the process to actually die (SIGKILL always works).
       await new Promise((r) => setTimeout(r, 500));
-      // NOW the callback should have fired.
       expect(stuckClearedAt).not.toBeNull();
+    } else {
+      console.log("  [info] integration test: process exited before timeout (fast machine) — stuck assertion skipped");
     }
     cleanupScript(script);
   });
