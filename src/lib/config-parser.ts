@@ -286,6 +286,27 @@ export function parseSubscription(text: string): ParsedConfig[] {
   });
 }
 
+// Lightweight URI counter — used by the client-side ImportDialog preview.
+// Returns counts BY PROTOCOL SCHEME without invoking the full parseConfigUri
+// (which uses Buffer for vmess base64 decoding). Browser-safe (no Node APIs).
+// A line is counted if it starts with one of the 4 supported schemes.
+export function countConfigUris(text: string): { total: number; byProtocol: Record<string, number> } {
+  const byProtocol: Record<string, number> = {};
+  let total = 0;
+  const lines = (text || "").split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const m = line.match(/^(vmess|vless|trojan|ss):\/\//i);
+    if (m) {
+      const proto = m[1].toLowerCase();
+      byProtocol[proto] = (byProtocol[proto] || 0) + 1;
+      total++;
+    }
+  }
+  return { total, byProtocol };
+}
+
 // Pick the most optimized configs: score >= 55 (TLS / Reality / WS / gRPC).
 export function pickOptimized(configs: ParsedConfig[], limit = 60): ParsedConfig[] {
   return configs

@@ -30,7 +30,28 @@ export async function POST(req: NextRequest) {
     if (lines.length === 1) {
       const parsed = parseConfigUri(lines[0]);
       if (!parsed) {
-        return NextResponse.json({ error: "Could not parse the provided URI" }, { status: 400 });
+        // Diagnostic: tell the user WHY parsing failed so they can fix it.
+        const line = lines[0];
+        let reason = "Unknown scheme or malformed URI";
+        const lower = line.toLowerCase();
+        if (!lower.startsWith("vmess://") && !lower.startsWith("vless://") && !lower.startsWith("trojan://") && !lower.startsWith("ss://")) {
+          reason = `Unsupported scheme — only vmess://, vless://, trojan://, ss:// are recognized. Got: "${line.slice(0, 30)}${line.length > 30 ? "…" : ""}"`;
+        } else if (lower.startsWith("vmess://")) {
+          reason = "vmess:// URI must be base64-encoded JSON. The base64 payload could not be decoded or did not contain valid JSON. Make sure you copied the full vmess:// link.";
+        } else if (lower.startsWith("vless://")) {
+          reason = "vless:// URI must be in the form vless://uuid@host:port?params#label. Check that host and port are present.";
+        } else if (lower.startsWith("trojan://")) {
+          reason = "trojan:// URI must be in the form trojan://password@host:port?params#label. Check that host and port are present.";
+        } else if (lower.startsWith("ss://")) {
+          reason = "ss:// URI must be either ss://base64(method:pass)@host:port#label or ss://base64(method:pass@host:port)#label. Could not extract host:port.";
+        }
+        return NextResponse.json({ error: `Could not parse the provided URI: ${reason}` }, { status: 400 });
+      }
+      // Validate host + port are non-empty (some URIs parse but produce empty host).
+      if (!parsed.host || !parsed.port || parsed.port <= 0 || parsed.port > 65535) {
+        return NextResponse.json({
+          error: `Parsed URI is missing host or port. Got host="${parsed.host}", port=${parsed.port}. The URI format may be incomplete or non-standard.`,
+        }, { status: 400 });
       }
       let sub = await db.subscription.findFirst({ where: { kind: "manual", label: source } });
       if (!sub) {
@@ -63,7 +84,14 @@ export async function POST(req: NextRequest) {
     }
 
     // Multi-line: bulk import
-    const count = await importRawConfigs(raw, source);
+    let count: number;
+    try {
+      count = await importRawConfigs(raw, source);
+    } catch (e) {
+      // Surface the actual reason (e.g. "No valid configs found in input")
+      const msg = (e as Error)?.message ?? "Bulk import failed";
+      return NextResponse.json({ error: msg }, { status: 400 });
+    }
     return NextResponse.json({ ok: true, count }, { status: 201 });
   } catch (err) {
     console.error("[api/imported-configs/import] POST failed", err);

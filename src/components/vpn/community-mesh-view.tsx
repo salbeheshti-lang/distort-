@@ -1,12 +1,14 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import {
   Search, Shield, Crown, Zap, X, Check, Wifi, RefreshCw, Plus, Link2, Trash2, Star,
-  Copy, Download, Filter, AlertCircle, Globe2, Activity, Server as ServerIcon, Clock,
+  Copy, Download, Filter, AlertCircle, Globe2, Activity, Server as ServerIcon, Clock, Power,
 } from "lucide-react";
-import { useFetch, postJSON } from "@/hooks/use-fetch";
+import { useFetch, postJSON, postJSONSoft, putJSON } from "@/hooks/use-fetch";
+import { useVpnStore, type ServerLite } from "@/lib/vpn-store";
+import { countConfigUris } from "@/lib/config-parser";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -18,7 +20,6 @@ import {
 } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { putJSON } from "@/hooks/use-fetch";
 
 type ImportedConfig = {
   id: string;
@@ -79,7 +80,7 @@ function scoreColor(score: number): string {
   return "#8aa0c4";
 }
 
-export function CommunityMeshView() {
+export function CommunityMeshView({ onConnected }: { onConnected?: () => void }) {
   const [tab, setTab] = useState<"optimized" | "all" | "favorites">("optimized");
   const [query, setQuery] = useState("");
   const [proto, setProto] = useState<string>("all");
@@ -87,6 +88,13 @@ export function CommunityMeshView() {
   const [showAddSub, setShowAddSub] = useState(false);
   const [refreshing, setRefreshing] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
+  // Tracks which config card is currently mid-connect/disconnect/switch flow.
+  // Null = no flow in progress. Used to drive per-card spinner + global disable.
+  const [connectingId, setConnectingId] = useState<string | null>(null);
+
+  // Subscribe to vpn state so the per-card Connect button reflects reality.
+  const vpnState = useVpnStore((s) => s.state);
+  const currentServer = useVpnStore((s) => s.currentServer);
 
   const subsState = useFetch<{ subscriptions: Subscription[] }>("/api/subscriptions");
   const configsState = useFetch<{ configs: ImportedConfig[]; count: number }>(
@@ -96,6 +104,114 @@ export function CommunityMeshView() {
   const subscriptions = subsState.data?.subscriptions ?? [];
   const configs = configsState.data?.configs ?? [];
   const totalImported = configsState.data?.count ?? 0;
+
+  // ---- Shared connect flow (used by BOTH per-card Connect button and Quick Connect) ----
+  // Mirrors connect-view.tsx lines 71-185 (POST /api/emergency/.../uri → POST /api/tunnel/start
+  // → wait 3s → GET /api/tunnel/status → POST /api/tunnel/verify → vpn-store.connect()).
+  // On success, fires the optional onConnected() callback via a toast action button so
+  // the user can optionally jump to the Connect tab to see live stats (no auto-switch).
+  const connectConfig = useCallback(async (c: ImportedConfig) => {
+    const st = useVpnStore.getState();
+
+    // CASE A: clicking Connect on the SAME config we're already connected to → disconnect.
+    if (st.state === "connected" && st.currentServer?.id === c.id) {
+      setConnectingId(c.id);
+      toast.info("Disconnecting…", { description: `${c.protocol} ${c.host}:${c.port}` });
+      try {
+        st.disconnect();
+        try { await fetch("/api/tunnel/stop", { method: "POST" }); } catch {}
+        toast.success("Disconnected", { description: "Tunnel stopped." });
+      } catch (e) {
+        toast.error("Disconnect failed", { description: (e as Error).message });
+      } finally {
+        setConnectingId(null);
+      }
+      return;
+    }
+
+    // CASE B: switching from another connected config → stop the old tunnel first.
+    setConnectingId(c.id);
+    const switching = st.state === "connected";
+    if (switching) {
+      toast.info("Switching tunnel…", { description: `Stopping current → starting ${c.protocol} ${c.host}:${c.port}` });
+      try { await fetch("/api/tunnel/stop", { method: "POST" }); } catch {}
+      st.disconnect();
+    } else {
+      toast.info("Connecting…", { description: `${c.protocol} → ${c.host}:${c.port}` });
+    }
+
+    try {
+      // Step 1: fetch the config URI from the public, rate-limited endpoint.
+      const uriResp = await postJSONSoft<{ id: string; uri: string; protocol: string; host: string; port: number }>(
+        `/api/emergency/candidates/${c.id}/uri`,
+        {}
+      );
+      if (!uriResp.ok || !uriResp.data?.uri) {
+        throw new Error(uriResp.error || "Failed to fetch config URI");
+      }
+      const configUri = uriResp.data.uri;
+
+      // Step 2: ask the desktop companion (127.0.0.1:10810) to start xray with this URI.
+      const startResp = await postJSONSoft<{ ok: boolean; error?: string }>("/api/tunnel/start", { configUri });
+      if (!startResp.ok || !startResp.data?.ok) {
+        throw new Error(startResp.error || startResp.data?.error || "Tunnel failed to start");
+      }
+
+      // Step 3: wait 3s for xray to fully initialize before probing status.
+      await new Promise((r) => setTimeout(r, 3000));
+
+      // Step 4: confirm xray is still running.
+      const statusResp = await fetch("/api/tunnel/status");
+      if (!statusResp.ok) throw new Error("Cannot check tunnel status");
+      const statusData = await statusResp.json();
+      if (!statusData.running) throw new Error("xray crashed after starting — check logs");
+
+      // Step 5: verify traffic actually flows through the tunnel.
+      const verifyResp = await fetch("/api/tunnel/verify", { method: "POST" });
+      if (!verifyResp.ok) throw new Error("Tunnel started but verification endpoint failed");
+      const verifyData = await verifyResp.json();
+      if (!verifyData.trafficVerified) {
+        throw new Error(`Tunnel started but traffic verification failed: ${verifyData.error || "unknown"}`);
+      }
+
+      // Step 6: SUCCESS — synthesize a ServerLite and update the zustand store.
+      // Mirrors connect-view.tsx lines 115-132 (same field shape, same `as ServerLite` cast).
+      const serverLite = {
+        id: c.id,
+        code: c.host,
+        country: c.country || "Iran",
+        countryCode: "",
+        city: c.host,
+        flag: "🌐",
+        host: c.host,
+        port: c.port,
+        protocols: [c.protocol],
+        load: 0,
+        ping: verifyData.latencyMs || 50,
+        upMbps: 1000,
+        downMbps: 1000,
+        online: true,
+        premium: false,
+        stealth: true,
+        note: c.flags,
+      } as ServerLite;
+
+      const store = useVpnStore.getState();
+      store.connect(serverLite, c.protocol);
+      if (verifyData.exitIp) {
+        store.setExitInfo(verifyData.exitIp, verifyData.exitCountry || "");
+      }
+
+      toast.success("Connected!", {
+        description: `Exit IP: ${verifyData.exitIp || "unknown"}`,
+        action: onConnected ? { label: "View stats", onClick: onConnected } : undefined,
+      });
+    } catch (e) {
+      toast.error("Connection failed", { description: (e as Error).message });
+    } finally {
+      setConnectingId(null);
+    }
+  }, [onConnected]);
 
   const refreshSub = async (id: string, label: string) => {
     setRefreshing(id);
@@ -269,6 +385,25 @@ export function CommunityMeshView() {
               <Button variant="outline" onClick={downloadSub} className="border-white/10 text-muted-foreground hover:text-white font-tech uppercase tracking-wider text-xs h-9">
                 <Download className="w-3.5 h-3.5 mr-1.5" /> Export
               </Button>
+              <Button
+                onClick={() => {
+                  if (!configs.length) {
+                    toast.error("No configs available", { description: "Import or refresh a subscription first." });
+                    return;
+                  }
+                  void connectConfig(configs[0]);
+                }}
+                disabled={connectingId !== null || configs.length === 0}
+                className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider text-xs h-9"
+                title="Connect to the highest-scored config in this view"
+              >
+                {connectingId === configs[0]?.id ? (
+                  <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+                ) : (
+                  <Zap className="w-3.5 h-3.5 mr-1.5" />
+                )}
+                {connectingId === configs[0]?.id ? "Connecting…" : "Quick Connect"}
+              </Button>
               <Button onClick={() => setShowImport(true)} className="bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider text-xs h-9">
                 <Plus className="w-3.5 h-3.5 mr-1.5" /> Import
               </Button>
@@ -322,13 +457,20 @@ export function CommunityMeshView() {
             <div className="max-h-[560px] overflow-y-auto pr-1 -mr-1 space-y-2">
               {configs.map((c, i) => {
                 const flags = c.flags ? c.flags.split(",").filter(Boolean) : [];
+                const isCurrentConnected = vpnState === "connected" && currentServer?.id === c.id;
+                const isBusy = connectingId === c.id;
+                const anyBusy = connectingId !== null;
                 return (
                   <motion.div
                     key={c.id}
                     initial={{ opacity: 0, y: 6 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: Math.min(i * 0.01, 0.3) }}
-                    className="rounded-xl border border-white/5 bg-white/[0.02] hover:border-[#00f0ff]/20 hover:bg-white/[0.04] transition-colors p-3"
+                    className={`rounded-xl border bg-white/[0.02] hover:bg-white/[0.04] transition-colors p-3 ${
+                      isCurrentConnected
+                        ? "border-[#10d9a0]/40 shadow-[0_0_18px_rgba(16,217,160,0.12)]"
+                        : "border-white/5 hover:border-[#00f0ff]/20"
+                    }`}
                   >
                     <div className="flex items-center gap-3">
                       <span className="text-xl">{flagFor(c.country)}</span>
@@ -343,6 +485,12 @@ export function CommunityMeshView() {
                               {f}
                             </Badge>
                           ))}
+                          {isCurrentConnected && (
+                            <Badge variant="outline" className="text-[9px] font-tech uppercase tracking-wider h-4 border-[#10d9a0]/40 text-[#10d9a0] inline-flex items-center gap-1">
+                              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#10d9a0] animate-pulse" />
+                              Connected
+                            </Badge>
+                          )}
                         </div>
                         <div className="text-[11px] text-muted-foreground font-mono truncate mt-0.5">
                           {c.host}:{c.port} · {c.network}/{c.security}
@@ -364,6 +512,33 @@ export function CommunityMeshView() {
                         </div>
                       </div>
                       <div className="flex items-center gap-1">
+                        {/* Connect / Disconnect — primary action */}
+                        {isCurrentConnected ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void connectConfig(c)}
+                            disabled={anyBusy}
+                            className="h-8 border-[#ff4d6d]/40 text-[#ff4d6d] hover:bg-[#ff4d6d]/10 font-tech uppercase tracking-wider text-[10px]"
+                            title="Disconnect this tunnel"
+                          >
+                            {isBusy ? <RefreshCw className="w-3 h-3 mr-1 animate-spin" /> : <Power className="w-3 h-3 mr-1" />}
+                            {isBusy ? "Stopping…" : "Disconnect"}
+                          </Button>
+                        ) : (
+                          <Button
+                            size="sm"
+                            onClick={() => void connectConfig(c)}
+                            disabled={anyBusy}
+                            className="h-8 bg-brand-gradient text-[#02131a] hover:opacity-90 font-tech uppercase tracking-wider text-[10px]"
+                            title={vpnState === "connected" ? `Switch from current to ${c.protocol} ${c.host}:${c.port}` : `Connect to ${c.protocol} ${c.host}:${c.port}`}
+                          >
+                            {isBusy ? <RefreshCw className="w-3 h-3 mr-1 animate-spin" /> : <Power className="w-3 h-3 mr-1" />}
+                            {isBusy
+                              ? (vpnState === "connected" ? "Switching…" : "Connecting…")
+                              : (vpnState === "connected" ? "Switch" : "Connect")}
+                          </Button>
+                        )}
                         <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground hover:text-[#ffb020]" onClick={() => toggleFav(c)}>
                           <Star className={`w-3.5 h-3.5 ${c.favorite ? "fill-[#ffb020] text-[#ffb020]" : ""}`} />
                         </Button>
@@ -410,6 +585,13 @@ function ImportDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenCha
   const [source, setSource] = useState("personal");
   const [busy, setBusy] = useState(false);
 
+  // Live-parse preview: count supported URIs by protocol scheme.
+  // Uses countConfigUris (browser-safe regex; no Buffer dependency).
+  const preview = useMemo(() => {
+    if (!raw.trim()) return null;
+    return countConfigUris(raw);
+  }, [raw]);
+
   const handleImport = async () => {
     if (!raw.trim()) return;
     setBusy(true);
@@ -450,6 +632,21 @@ function ImportDialog({ open, onOpenChange, onDone }: { open: boolean; onOpenCha
               placeholder={"vless://uuid@host:443?security=reality&sni=...#my-server\nvmess://eyJhZGQ...\ntrojan://pass@host:443#my-trojan"}
               className="bg-white/[0.04] border-white/10 font-mono text-xs min-h-[180px] resize-y"
             />
+            {/* Live preview — green when valid URIs detected, red when paste is non-empty but no URIs found */}
+            {preview && preview.total > 0 && (
+              <div className="text-[11px] text-[#10d9a0] flex items-center gap-1.5 font-tech">
+                <Check className="w-3 h-3 flex-shrink-0" />
+                <span>
+                  Detected: {Object.entries(preview.byProtocol).map(([k, v]) => `${v} ${k}`).join(", ")} ({preview.total} total)
+                </span>
+              </div>
+            )}
+            {preview && preview.total === 0 && (
+              <div className="text-[11px] text-[#ff4d6d] flex items-start gap-1.5">
+                <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                <span>No valid URIs detected. Make sure each line starts with vmess://, vless://, trojan://, or ss://</span>
+              </div>
+            )}
           </div>
           <p className="text-[11px] text-muted-foreground/70">
             Single URIs are auto-favorited. Bulk pastes are deduplicated by host:port. Optimized configs (TLS/Reality/WS/gRPC) are highlighted.

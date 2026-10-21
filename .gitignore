@@ -68,3 +68,4 @@ public/DISTORT-*.zip
 *.apk
 *.dmg
 *.AppImage
+tool-results/

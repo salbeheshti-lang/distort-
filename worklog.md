@@ -1109,3 +1109,52 @@ Stage Summary:
   - Code signing: NOT done (no cert)
   - Release keystore: NOT generated (maintainer must do this + add GitHub Secrets)
   - First GitHub Release with proper versioning: NOT published yet
+
+---
+Task ID: MESH-CONNECT-FIX
+Agent: Community-Mesh-Fixer
+Task: Add Connect button + flow to Distort Config tab so users can actually use the configs
+
+Work Log:
+- Read worklog.md + community-mesh-view.tsx + connect-view.tsx (lines 71-185 reference) + use-fetch.ts + vpn-store.ts + dashboard.tsx + config-parser.ts to understand the existing connect flow + UI patterns before touching anything.
+- Identified the user's pain point: each Distort Config card had only Star/Copy/Trash buttons — no way to actually connect to the config.
+- Confirmed the connect flow already exists in connect-view.tsx (POST /api/emergency/candidates/[id]/uri → POST /api/tunnel/start → wait 3s → GET /api/tunnel/status → POST /api/tunnel/verify → useVpnStore.connect()). The Community Mesh view just needs to mirror it.
+- Added a new browser-safe `countConfigUris(text)` helper to /home/z/my-project/src/lib/config-parser.ts. Returns `{ total, byProtocol }` keyed by scheme (vmess/vless/trojan/ss). Implemented with pure regex (no Buffer.from) so it runs cleanly in client components — the existing parseConfigUri/parseSubscription use Buffer for vmess base64 decode, which is server-only.
+- Refactored /home/z/my-project/src/components/vpn/community-mesh-view.tsx:
+  - Added imports: useCallback, Power icon, postJSONSoft, useVpnStore + ServerLite type, countConfigUris.
+  - Changed `CommunityMeshView` signature to accept `{ onConnected?: () => void }` prop.
+  - Added `connectingId: string | null` state — tracks which card is mid-flow (used for spinner + global disable).
+  - Added reactive `vpnState` + `currentServer` subscriptions via `useVpnStore((s) => s.state)` so the per-card button reflects the live connection state without polling.
+  - Extracted a single `connectConfig(c: ImportedConfig)` useCallback function — used by BOTH the per-card Connect button and the Quick Connect toolbar button. Handles 3 cases:
+    (A) Same config already connected → disconnect via store + POST /api/tunnel/stop.
+    (B) Different config connected → stop the old tunnel first, then start the new one (shows "Switching…" loading).
+    (C) Fresh connect → run the full 5-step flow (URI fetch → tunnel start → 3s wait → status check → verify).
+  - On success: synthesizes a ServerLite (mirrors connect-view.tsx lines 115-132 shape — including `countryCode: ""` and `protocols: [c.protocol]` to satisfy strict TS), calls `useVpnStore.getState().connect(serverLite, c.protocol)`, sets exit IP info if verify returned one, fires a sonner toast with `action: { label: "View stats", onClick: onConnected }` so the user can OPTIONALLY jump to the Connect tab to see live stats — no auto-switch (better UX per the task brief).
+  - On failure: extracts the backend error message via postJSONSoft and shows it in the toast (no more "HTTP 500" generic errors).
+  - Added a prominent "Quick Connect" button to the toolbar (Zap icon + brand-gradient background) — picks `configs[0]` (already sorted by favorite DESC, score DESC by the API) and triggers connectConfig. Disabled when busy or when configs is empty.
+  - Added a per-card Connect/Disconnect button to each config card's actions row (placed BEFORE the Star/Copy/Trash icon buttons). Uses brand-gradient for "Connect"/"Switch" and red outline for "Disconnect". Shows spinner + "Connecting…"/"Switching…"/"Stopping…" when `connectingId === c.id`. All Connect buttons disabled while any flow is in progress (since you can only have one tunnel at a time).
+  - Added a green "● Connected" badge to the title row of the card that matches the currently-active `currentServer?.id`. Also added a subtle green border + glow shadow to that card so the user can spot the active config at a glance.
+  - Added live-parse preview to ImportDialog: as the user types in the URIs textarea, `useMemo` runs `countConfigUris(raw)` on every keystroke. Shows green "Detected: 3 vless, 2 vmess, 1 trojan (6 total)" when valid URIs are found, or red "No valid URIs detected. Make sure each line starts with vmess://, vless://, trojan://, or ss://" when the textarea is non-empty but no valid URIs are found. This gives the user INSTANT feedback BEFORE they hit Import, eliminating the round-trip error discovery.
+- Updated /home/z/my-project/src/components/vpn/dashboard.tsx line 129: passed `onConnected={() => setView("connect")}` to CommunityMeshView so the "View stats" toast action takes the user to the Connect tab.
+- Verified existing Star/Copy/Trash buttons + Import dialog + subscription refresh + reach-check flows still work unchanged (only ADDED to the actions row, didn't remove anything).
+
+Verification:
+- `cd /home/z/my-project && bun run lint` → 0 errors, 1 pre-existing warning in src/app/admin/page.tsx (untouched by me — same warning reported by previous agent's worklog). PASS.
+- `cd /home/z/my-project && bunx tsc --noEmit` → 0 errors in my touched files (community-mesh-view.tsx, config-parser.ts, dashboard.tsx line 129). Pre-existing errors remain in unrelated files (connect-view.tsx:115 same `as ServerLite` cast pattern — pre-existing, not touched; dashboard.tsx:211-212 in SystemStatusButton — pre-existing, not touched; vpn-store.ts:220 — pre-existing; desktop/*, mobile/*, examples/*, skills/*, src/lib/__tests__/* — pre-existing). PASS for my scope.
+- Checked dev.log: 7 successful compiles ("Compiled in Nms") with no compile errors or runtime exceptions related to my changes. The only error in the log is `Error: listen EADDRINUSE: address already in use :::3000` from a stale dev-server start attempt — unrelated to my code. The currently-running dev server compiled and served the homepage with HTTP 200, and the /api/imported-configs + /api/subscriptions endpoints responded normally.
+- Visual sanity check: confirmed Quick Connect button renders at line 388-406 (toolbar, between Export and Import), per-card Connect/Disconnect button at lines 514-541 (actions row, before Star), Connected badge at lines 488-493 (title row), live preview at lines 635-649 (ImportDialog below textarea). JSX balanced.
+
+Stage Summary:
+- Files touched (3):
+  - src/lib/config-parser.ts (+20 lines): added `countConfigUris(text)` browser-safe export.
+  - src/components/vpn/community-mesh-view.tsx (535 → 733 lines, +198 lines): added imports, onConnected prop, connectingId state, connectConfig useCallback, Quick Connect button, per-card Connect/Disconnect button, Connected badge + green-border highlight, ImportDialog live preview.
+  - src/components/vpn/dashboard.tsx (1 line changed: line 129): passed `onConnected={() => setView("connect")}` to CommunityMeshView.
+- Honest limitations:
+  - NOT runtime-tested against the real desktop companion (127.0.0.1:10810). The connect flow mirrors connect-view.tsx exactly, which the previous agent also did NOT runtime-test against a real xray instance. The 5-step flow will only succeed end-to-end if the Electron desktop companion is running and reachable from the Next.js server. On the web-only dev environment, `/api/tunnel/start` will return a structured error and the toast will surface it.
+  - The `as ServerLite` cast on the synthesized server object (community-mesh-view.tsx line ~197) mirrors the SAME pre-existing pattern in connect-view.tsx line 132. Strict TS already flags connect-view.tsx:115 with TS2352 ("may be a mistake") — but the file is unchanged from before. My community-mesh-view.tsx version actually includes `countryCode: ""` and `protocols: [c.protocol]` (a string array, not a bare string like the connect-view.tsx version), so my object overlaps ServerLite MORE correctly than the existing one does. No new TS errors introduced.
+  - When the user clicks Connect while a DIFFERENT config is connected, the disconnect POST is fired-and-forgotten (try/catch swallow) so a slow /api/tunnel/stop response won't block the new connect — but if the stop genuinely failed at the companion, the subsequent /api/tunnel/start might race against a still-running xray. This mirrors the same edge case in connect-view.tsx and is a known limitation of the current companion API design; fixing it properly would require a companion-side "restart" endpoint.
+  - The Quick Connect button uses `configs[0]` from the currently-active tab — so on the "Favorites" tab it picks the user's favorite config, on "All" it picks the top-scored across all buckets, on "Optimized" it picks the highest optimized. This matches the user's mental model ("best optimized config" → "top of the list I'm currently looking at").
+- Next actions for the maintainer:
+  - If a real xray companion is available, end-to-end test the per-card Connect button on a known-good Reality config — should show "Connecting…" → "Connected!" toast with exit IP + the "● Connected" badge appearing on that card.
+  - Verify the "Switch" flow works: connect to config A, then click Connect on config B — should briefly show "Switching…" on card B, stop A, start B, then the badge moves from A to B.
+  - Consider adding a "Stop all" button somewhere visible if the user wants to disconnect without scrolling to find the active card — the per-card Disconnect works but the user has to find the card with the green badge first.

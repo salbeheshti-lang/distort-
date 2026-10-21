@@ -126,7 +126,7 @@ export function Dashboard({ onClose }: { onClose: () => void }) {
             >
               {view === "connect" && <ConnectView onPickServer={() => setView("servers")} />}
               {view === "servers" && <ServerListView onConnected={() => setView("connect")} />}
-              {view === "mesh" && <CommunityMeshView />}
+              {view === "mesh" && <CommunityMeshView onConnected={() => setView("connect")} />}
               {view === "emergency" && <EmergencyConnectivityView />}
               {view === "speedtest" && <SpeedTestView />}
               {view === "stats" && <StatsView />}
