@@ -592,6 +592,12 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   vpnProcess.stderr?.on("data", (data) => {
     const line = data.toString().trim();
     log.error(`[xray] ${line}`);
+    // STALE GUARD: if this stderr is from a previous attempt (xray was killed
+    // but is still emitting as it dies), don't let it corrupt the current state.
+    if (attemptId !== currentVerifyAttempt) {
+      log.info(`[startVpnEngine] stale stderr from attempt ${attemptId} — dropping: ${line.slice(0, 80)}`);
+      return;
+    }
     // Capture real errors — don't show "connected" if xray failed to start
     if (line.includes("error") || line.includes("failed") || line.includes("panic")) {
       startupError = line;
@@ -611,6 +617,12 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   vpnProcess.on("exit", (code) => {
     log.info(`xray exited with code ${code}`);
     clearTimeout(startupTimeout);
+    // STALE GUARD: if this exit is from a previous attempt's xray process,
+    // don't let it overwrite the current vpn state.
+    if (attemptId !== currentVerifyAttempt) {
+      log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code ${code}) — dropping`);
+      return;
+    }
     if (store.get("vpn.connected")) {
       store.set("vpn", { ...store.get("vpn"), connected: false, startedAt: null });
       mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
