@@ -208,11 +208,49 @@ export async function stopXrayProcess(
     // Persistent exit listener: clears the stuck flag when the process
     // eventually dies. The caller's onStuckCleared callback handles the
     // global-state cleanup (xrayStuck flag + vpnProcess null).
-    proc.once("exit", () => {
-      log("warn", "stopXrayProcess: stuck xray process finally emitted 'exit' — clearing stuck state");
+    //
+    // FIX (v1.0.38 audit v6): the onStuckCleared callback must ONLY fire
+    // if BOTH ports are confirmed free after the process finally exits.
+    // Previously, the callback fired unconditionally — meaning if the ports
+    // were still held (TIME_WAIT or another process), xrayStuck would be
+    // cleared and the next spawn would race against the held ports.
+    //
+    // Also: use a named listener + a `stuckClearedFired` flag to prevent
+    // duplicate invocations if exit fires multiple times (shouldn't happen,
+    // but defensive against Node.js internal bugs).
+    let stuckClearedFired = false;
+    const onStuckExit = () => {
+      if (stuckClearedFired) return; // defensive: don't fire twice
+      stuckClearedFired = true;
+      log("warn", "stopXrayProcess: stuck xray process finally emitted 'exit' — re-checking ports before clearing stuck state");
       try { proc.removeListener("exit", onExit); } catch {}
-      opts?.onStuckCleared?.();
-    });
+      try { proc.removeListener("exit", onStuckExit); } catch {}
+      // Re-probe BOTH ports. If either is still in use, do NOT clear the
+      // stuck flag — the next spawn would hit EADDRINUSE. Log a CRITICAL
+      // error so the user knows they need to restart the app.
+      waitForPortReleased(socksPort, portProbeAttempts, portProbeIntervalMs)
+        .then((socksFree) => waitForPortReleased(httpPort, portProbeAttempts, portProbeIntervalMs)
+          .then((httpFree) => {
+            if (socksFree && httpFree) {
+              log("info", `stopXrayProcess: stuck process exited + ports ${socksPort}/${httpPort} now free — clearing stuck state`);
+              opts?.onStuckCleared?.();
+            } else {
+              log("error",
+                `stopXrayProcess: stuck process finally exited BUT ports still held ` +
+                `(SOCKS ${socksPort} free=${socksFree}, HTTP ${httpPort} free=${httpFree}). ` +
+                "NOT clearing stuck state — user must restart the app. The next spawn " +
+                "would hit EADDRINUSE."
+              );
+              // Do NOT call onStuckCleared — xrayStuck stays true.
+            }
+          })
+        )
+        .catch((e: any) => {
+          log("error", `stopXrayProcess: port re-probe threw (${e?.message}) — NOT clearing stuck state`);
+          // Do NOT call onStuckCleared — be safe.
+        });
+    };
+    proc.once("exit", onStuckExit);
   } else {
     // Phase 4: Port-release probe (only if the process actually exited).
     const socksFree = await waitForPortReleased(socksPort, portProbeAttempts, portProbeIntervalMs, (m) => log("warn", m));

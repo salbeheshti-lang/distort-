@@ -172,50 +172,154 @@ describe("stopXrayProcess — production code (real import)", () => {
     cleanupScript(script);
   });
 
-  test("port 10809 free but 10808 in use → portsReleased=false", async () => {
-    // Bind a mock server to 10808 (SOCKS port) but NOT 10809 (HTTP port).
-    // After the process exits, 10808 is still held by the lingering server.
-    const script = createMockScript({ ignoreSigterm: false, bindPort: 10808 });
-    const proc = spawn("node", [script]);
-    await new Promise((r) => setTimeout(r, 150)); // let it bind
+  test("port 10809 free but 10808 in use → portsReleased=false (external server holds port)", async () => {
+    // Use a DYNAMIC port pair to avoid CI conflicts with fixed ports.
+    // Bind an external server to the SOCKS port (simulates a stuck/lingering
+    // process or TIME_WAIT). The HTTP port is left free.
+    const socksPort = 41000 + Math.floor(Math.random() * 1000);
+    const httpPort = socksPort + 1;
 
-    // The mock process binds 10808. When we kill it, the port MAY still be
-    // in TIME_WAIT briefly. The port probe should detect it's still in use
-    // (or free, depending on timing).
-    const result = await stopXrayProcess(proc, {
-      sigtermTimeoutMs: 1000,
-      sigkillTimeoutMs: 2000,
-      portProbeAttempts: 2,
-      portProbeIntervalMs: 50,
-      socksPort: 10808,
-      httpPort: 10809,
+    const socksServer = net.createServer(() => {});
+    await new Promise<void>((resolve) => {
+      socksServer.listen(socksPort, "127.0.0.1", resolve);
     });
 
-    expect(result.didExit).toBe(true);
-    expect(result.stuck).toBe(false);
-    // 10808 may or may not be free depending on OS TIME_WAIT. We don't
-    // assert portsReleased here — the test is that the function RUNS without
-    // error and returns a valid result. The LOGIC of "both ports must be
-    // free" is tested in the waitForPortReleased unit tests below.
-    cleanupScript(script);
+    try {
+      // Spawn a mock xray that does NOT bind any port — it just exits on SIGTERM.
+      // The port is held by our external socksServer, NOT by the child.
+      const script = createMockScript({ ignoreSigterm: false });
+      const proc = spawn("node", [script]);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const result = await stopXrayProcess(proc, {
+        sigtermTimeoutMs: 1000,
+        sigkillTimeoutMs: 2000,
+        portProbeAttempts: 3,
+        portProbeIntervalMs: 50,
+        socksPort,
+        httpPort,
+      });
+
+      expect(result.didExit).toBe(true);
+      expect(result.stuck).toBe(false);
+      // CRITICAL ASSERTION: portsReleased MUST be false because the external
+      // server is still holding socksPort.
+      expect(result.portsReleased).toBe(false);
+      cleanupScript(script);
+    } finally {
+      await new Promise<void>((resolve) => socksServer.close(() => resolve()));
+    }
   });
 
-  test("port 10808 free but 10809 in use → portsReleased=false", async () => {
-    const script = createMockScript({ ignoreSigterm: false, bindPort: 10809 });
-    const proc = spawn("node", [script]);
-    await new Promise((r) => setTimeout(r, 150));
+  test("port 10808 free but 10809 in use → portsReleased=false (external server holds port)", async () => {
+    const socksPort = 43000 + Math.floor(Math.random() * 1000);
+    const httpPort = socksPort + 1;
 
-    const result = await stopXrayProcess(proc, {
-      sigtermTimeoutMs: 1000,
-      sigkillTimeoutMs: 2000,
-      portProbeAttempts: 2,
-      portProbeIntervalMs: 50,
-      socksPort: 10808,
-      httpPort: 10809,
+    const httpServer = net.createServer(() => {});
+    await new Promise<void>((resolve) => {
+      httpServer.listen(httpPort, "127.0.0.1", resolve);
     });
 
-    expect(result.didExit).toBe(true);
-    expect(result.stuck).toBe(false);
+    try {
+      const script = createMockScript({ ignoreSigterm: false });
+      const proc = spawn("node", [script]);
+      await new Promise((r) => setTimeout(r, 100));
+
+      const result = await stopXrayProcess(proc, {
+        sigtermTimeoutMs: 1000,
+        sigkillTimeoutMs: 2000,
+        portProbeAttempts: 3,
+        portProbeIntervalMs: 50,
+        socksPort,
+        httpPort,
+      });
+
+      expect(result.didExit).toBe(true);
+      expect(result.stuck).toBe(false);
+      // CRITICAL ASSERTION: portsReleased MUST be false because the external
+      // server is still holding httpPort.
+      expect(result.portsReleased).toBe(false);
+      cleanupScript(script);
+    } finally {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  test("stuck process exits but port still held → onStuckCleared NOT called", async () => {
+    // This tests the v6 fix: if a stuck process finally exits but the ports
+    // are still held by an external server, the onStuckCleared callback
+    // must NOT fire (xrayStuck stays true).
+    const socksPort = 45000 + Math.floor(Math.random() * 1000);
+    const httpPort = socksPort + 1;
+
+    // Bind an external server to socksPort — it will stay alive even after
+    // the mock xray process exits.
+    const socksServer = net.createServer(() => {});
+    await new Promise<void>((resolve) => {
+      socksServer.listen(socksPort, "127.0.0.1", resolve);
+    });
+
+    try {
+      // Spawn a mock xray that ignores SIGTERM — forces the SIGKILL path.
+      // Use a very short sigkillTimeout so didExit is false at decision time
+      // (the exit event hasn't fired yet).
+      const script = createMockScript({ ignoreSigterm: true });
+      const proc = spawn("node", [script]);
+      await new Promise((r) => setTimeout(r, 100));
+
+      let stuckCleared = false;
+      const result = await stopXrayProcess(proc, {
+        sigtermTimeoutMs: 100,
+        sigkillTimeoutMs: 50, // very short — exit event likely hasn't fired
+        portProbeAttempts: 3,
+        portProbeIntervalMs: 50,
+        socksPort,
+        httpPort,
+        onStuckCleared: () => { stuckCleared = true; },
+      });
+
+      if (result.stuck) {
+        // The process is stuck. Wait for it to actually die (SIGKILL always
+        // works eventually). After exit, onStuckExit fires and re-probes ports.
+        await new Promise((r) => setTimeout(r, 500));
+
+        // The external socksServer is still holding socksPort, so
+        // onStuckCleared must NOT have been called.
+        expect(stuckCleared).toBe(false);
+      }
+      cleanupScript(script);
+    } finally {
+      await new Promise<void>((resolve) => socksServer.close(() => resolve()));
+    }
+  });
+
+  test("stuck process exits + ports free → onStuckCleared called", async () => {
+    // Contrast: if a stuck process exits AND both ports are free, the
+    // onStuckCleared callback MUST fire.
+    const socksPort = 47000 + Math.floor(Math.random() * 1000);
+    const httpPort = socksPort + 1;
+
+    // No external server — both ports are free.
+    const script = createMockScript({ ignoreSigterm: true });
+    const proc = spawn("node", [script]);
+    await new Promise((r) => setTimeout(r, 100));
+
+    let stuckCleared = false;
+    const result = await stopXrayProcess(proc, {
+      sigtermTimeoutMs: 100,
+      sigkillTimeoutMs: 50,
+      portProbeAttempts: 3,
+      portProbeIntervalMs: 50,
+      socksPort,
+      httpPort,
+      onStuckCleared: () => { stuckCleared = true; },
+    });
+
+    if (result.stuck) {
+      // Wait for exit + port re-probe.
+      await new Promise((r) => setTimeout(r, 800));
+      expect(stuckCleared).toBe(true);
+    }
     cleanupScript(script);
   });
 });
