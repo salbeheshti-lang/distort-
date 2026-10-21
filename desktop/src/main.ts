@@ -805,63 +805,69 @@ async function stopVpnEngine(): Promise<void> {
         });
       }
 
-      // FIX (v1.0.38 audit v3 — BUG 1: zombie/stuck process). If the 2s
-      // SIGKILL timeout fired and the process STILL hasn't actually emitted
-      // 'exit', we MUST NOT set `vpnProcess = null` — the process may still
-      // be alive (stuck in D-state / uninterruptible sleep, or a zombie the
-      // kernel hasn't reaped). Spawning a new xray now would create two
-      // processes fighting over ports 10808/10809.
+      // FIX (v1.0.38 audit v4 — CRITICAL: proc.killed is NOT a reliable death signal).
+      // The previous check was:
+      //   const procStillAlive = !proc.killed && proc.exitCode === null && proc.signalCode === null;
+      // This is WRONG because `proc.killed` only reflects whether kill() was successfully
+      // CALLED — it stays `true` immediately after SIGKILL even if the process hasn't
+      // emitted 'exit' yet. So when SIGKILL is sent + the 2s timeout fires, `proc.killed`
+      // is already `true`, which makes `!proc.killed === false`, which makes the whole
+      // expression `false` — so `procStillAlive` evaluates to FALSE, and the code falls
+      // into the "process is dead" branch + sets vpnProcess=null. This completely
+      // defeats the xrayStuck safety net.
       //
-      // Instead, register a PERSISTENT exit listener on the stuck proc (so
-      // when it eventually dies we clear the flag and null `vpnProcess`),
-      // and set `xrayStuck = true` so startVpnEngine / startTunnelFromUri
-      // refuse to spawn a new process until the stuck one dies.
+      // CORRECT logic: the ONLY reliable signal that the process is dead is the 'exit'
+      // event itself. We already track that via `didExit`. If `didExit === false` at this
+      // point, we MUST treat the process as stuck regardless of what `proc.killed` /
+      // `proc.exitCode` / `proc.signalCode` report (those fields are unreliable between
+      // signal delivery and the 'exit' event firing — they're set asynchronously by libuv).
       if (!didExit) {
-        // Defensive: if `proc.killed` is false AND `exitCode` is null, the
-        // process is genuinely still alive (or a zombie not yet reaped).
-        // proc.exitCode is `null` while running and `number` after exit.
-        const procStillAlive = !proc.killed && proc.exitCode === null && proc.signalCode === null;
-        if (procStillAlive) {
-          log.error(
-            "stopVpnEngine: CRITICAL — xray process did not exit within 2s of SIGKILL " +
-            "(stuck in uninterruptible sleep or unreaped zombie). NOT clearing vpnProcess. " +
-            "Future startVpnEngine / startTunnelFromUri calls will be refused until the " +
-            "stuck process finally exits."
-          );
-          xrayStuck = true;
-          stuck = true;
-          // Persistent exit listener: clears the stuck flag + nulls vpnProcess
-          // when the process eventually dies (could be seconds, minutes, or
-          // never — but at least we won't spawn a second xray on top of it).
-          proc.once("exit", () => {
-            log.warn("stopVpnEngine: stuck xray process finally exited — clearing xrayStuck flag");
-            xrayStuck = false;
-            // Only null vpnProcess if it's STILL pointing at this stuck proc
-            // (a newer start may have been refused — see xrayStuck checks in
-            // startVpnEngine / startTunnelFromUri — in which case vpnProcess
-            // is still this stuck proc).
-            if (vpnProcess === proc) {
-              vpnProcess = null;
-            }
-            // Clean up the listener we registered for onExit above (it would
-            // otherwise be a no-op leak since `sigtermResolved` is already true).
-            try { proc.removeListener("exit", onExit); } catch {}
-          });
-        } else {
-          // Process is dead but exit event may have raced with our 2s timer.
-          log.warn("stopVpnEngine: xray process is dead (killed/exitCode set) but 'exit' event lagged — proceeding");
-        }
+        // Process did NOT emit 'exit' within the 2s SIGKILL window. Treat as stuck.
+        // (proc.killed / exitCode / signalCode may all be set, but the 'exit' event
+        // is the only authoritative death signal in Node.js.)
+        log.error(
+          "stopVpnEngine: CRITICAL — xray process did not emit 'exit' within 2s of SIGKILL " +
+          "(stuck in uninterruptible sleep, unreaped zombie, or kill() signal was not " +
+          "delivered). NOT clearing vpnProcess. Future startVpnEngine / startTunnelFromUri " +
+          "calls will be refused until the stuck process finally emits 'exit'."
+        );
+        xrayStuck = true;
+        stuck = true;
+        // Persistent exit listener: clears the stuck flag + nulls vpnProcess
+        // when the process eventually dies (could be seconds, minutes, or
+        // never — but at least we won't spawn a second xray on top of it).
+        proc.once("exit", () => {
+          log.warn("stopVpnEngine: stuck xray process finally emitted 'exit' — clearing xrayStuck flag");
+          xrayStuck = false;
+          // Only null vpnProcess if it's STILL pointing at this stuck proc
+          // (a newer start may have been refused — see xrayStuck checks in
+          // startVpnEngine / startTunnelFromUri — in which case vpnProcess
+          // is still this stuck proc).
+          if (vpnProcess === proc) {
+            vpnProcess = null;
+          }
+          // Clean up the listener we registered for onExit above (it would
+          // otherwise be a no-op leak since `sigtermResolved` is already true).
+          try { proc.removeListener("exit", onExit); } catch {}
+        });
       }
+      // Note: the previous `else` branch ("process is dead but exit event lagged")
+      // was REMOVED — if `didExit` is false, we ALWAYS treat it as stuck. The
+      // "lagged exit event" scenario is exactly the bug: by the time the next
+      // spawn runs, the stuck proc could still be alive and holding ports.
 
       if (!stuck) {
-        // FIX (v1.0.38 audit v3 — BUG 3: 300ms wait is not port verification).
-        // Replace the fixed 300ms delay with an actual TCP probe to xray's HTTP
-        // proxy inbound (127.0.0.1:10809). The OS may take longer than 300ms to
-        // free the port (especially on Windows where TIME_WAIT can linger), and
-        // the next spawn would then hit EADDRINUSE. Probe up to 5 times with
-        // 100ms intervals; if the port is STILL open after ~1s, log a warning
-        // (the next spawn may fail) but proceed — do NOT block forever.
-        await waitForPortReleased(10809, 5, 100);
+        // FIX (v1.0.38 audit v4 — probe BOTH ports). The previous code only
+        // probed port 10809 (HTTP proxy). But xray listens on BOTH 10808 (SOCKS5)
+        // AND 10809 (HTTP). If only 10809 is free but 10808 is still held by the
+        // dying process, the next spawn will fail with EADDRINUSE on 10808.
+        // Probe BOTH ports with the same budget; if either is still in use,
+        // log a warning (the next spawn may fail).
+        const socksFree = await waitForPortReleased(10808, 5, 100);
+        const httpFree = await waitForPortReleased(10809, 5, 100);
+        if (!socksFree || !httpFree) {
+          log.warn(`stopVpnEngine: ports not fully released (SOCKS 10808 free=${socksFree}, HTTP 10809 free=${httpFree}) — next spawn may fail with EADDRINUSE`);
+        }
         // Clean up the SIGTERM-phase exit listener if it never fired (process
         // exited via kill-code path that didn't trigger our handler).
         try { proc.removeListener("exit", onExit); } catch {}
@@ -884,7 +890,6 @@ async function stopVpnEngine(): Promise<void> {
       vpnProcess = null;
     }
   }
-
 
   // If kill switch is enabled, block all non-tunnel traffic until user reconnects.
   // On Windows: use netsh advfirewall to add a block rule (requires admin).
