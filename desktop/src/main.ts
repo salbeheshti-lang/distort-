@@ -1539,224 +1539,175 @@ function writeCachedConfigs(configs: QuickConfig[]): void {
   } catch {}
 }
 
-async function quickConnect(): Promise<void> {
-  try {
-    // ---------------------------------------------------------------------
-    // Free-engine freshness check (Phase 4.2). Non-blocking — logs a warning
-    // if the locally-cached status.json is missing or stale (>6h old).
-    // ---------------------------------------------------------------------
-    checkFreeEngineFreshness();
+// Try one tier of configs. Returns true only when Xray verifies a live tunnel.
+// The shared attempted set prevents retrying the same URI when all.txt overlaps best.txt.
+async function tryQuickConnectTier(
+  configs: QuickConfig[],
+  attemptedUris: Set<string>,
+): Promise<boolean> {
+  if (configs.length === 0) return false;
 
-    // ---------------------------------------------------------------------
-    // Failover chain (Phase 4.1):
-    //   1. Free-engine best.txt  — GitHub-curated top-50 reachable configs
-    //   2. Free-engine all.txt   — ALL parsed configs (reachable first)
-    //   3. Local DB               — /api/imported-configs (user imports + default Iran sub)
-    //   3a. Subscription refresh  — if DB is empty, refresh + retry
-    //   4. mixed_iran.txt direct  — guaranteed upstream fallback
-    //   5. cached-configs.json    — offline / national-internet fallback
-    // ---------------------------------------------------------------------
+  log.info(\`Quick connect: testing \${configs.length} configs from \${configs[0]?.source || "unknown source"}\`);
 
-    let configs: QuickConfig[] = [];
+  for (let i = 0; i < configs.length; i++) {
+    const cfg = configs[i];
+    const attemptKey = cfg.uri || \`\${cfg.protocol}://\${cfg.host}:\${cfg.port}\`;
+    if (attemptedUris.has(attemptKey)) continue;
+    attemptedUris.add(attemptKey);
 
-    // Step 1: Free-engine best.txt
-    if (configs.length === 0) {
-      log.info("Quick connect: [1/5] trying free-engine best.txt");
-      configs = await fetchFreeEngineBest();
-      // Best-effort: also fetch + cache status.json so the next launch has
-      // an up-to-date freshness timestamp. Non-blocking.
-      fetchFreeEngineStatus().catch(() => {});
-    }
+    log.info(\`Quick connect: attempt \${attemptedUris.size} — \${cfg.protocol} \${cfg.host}:\${cfg.port} (src=\${cfg.source})\`);
 
-    // Step 2: Free-engine all.txt (fallback if best.txt is empty/unreachable)
-    if (configs.length === 0) {
-      log.info("Quick connect: [2/5] best.txt empty/unreachable — trying all.txt");
-      configs = await fetchFreeEngineAll();
-    }
-
-    // Step 3: Local DB (user imports + default Iran subscription)
-    if (configs.length === 0) {
-      log.info("Quick connect: [3/5] free-engine lists empty — trying local DB");
-      configs = await fetchLocalDbConfigs();
-    }
-
-    // Step 3a: Refresh subscriptions + retry local DB (only if 3 was empty)
-    if (configs.length === 0) {
-      log.info("Quick connect: [3a/5] local DB empty — refreshing subscriptions then retry");
-      configs = await refreshSubscriptionsAndFetchConfigs();
-    }
-
-    // Step 4: mixed_iran.txt direct (guaranteed upstream fallback)
-    if (configs.length === 0) {
-      log.info("Quick connect: [4/5] local DB still empty — fetching mixed_iran.txt directly");
-      configs = await fetchMixedIranDirect();
-    }
-
-    // Step 5: Cached configs from disk (national-internet / offline scenario)
-    if (configs.length === 0) {
-      log.info("Quick connect: [5/5] all live sources failed — using cached-configs.json");
-      configs = readCachedConfigs();
-    }
-
-    if (configs.length === 0) {
-      log.error("Quick connect: no configs available after all 5 fallback sources");
-      mainWindow?.webContents.send("vpn:error",
-        "No VPN configs available. All sources failed: free-engine (best.txt + all.txt), local DB, subscription refresh, mixed_iran.txt, and cached-configs.json."
-      );
-      return;
-    }
-
-    // Cache the full list to cached-configs.json so the next launch (offline
-    // scenario) has them as Fallback 5.
-    writeCachedConfigs(configs);
-
-    log.info(`Quick connect: trying ${configs.length} configs in sequence (auto-failover) — will try at least 10 before giving up`);
-
-    // ---------------------------------------------------------------------
-    // Failover loop — try each config until one connects successfully via
-    // xray. We do NOT give up until we've tried min(10, configs.length)
-    // configs, OR all of them.
-    // ---------------------------------------------------------------------
-    const MIN_ATTEMPTS = Math.min(10, configs.length);
-    let attempts = 0;
-
-    for (let i = 0; i < configs.length; i++) {
-      const cfg = configs[i];
-      attempts++;
-      log.info(`Quick connect: attempt ${i + 1}/${configs.length} (src=${cfg.source}) — ${cfg.protocol} ${cfg.host}:${cfg.port} (${cfg.flags || 'no flags'})`);
-
-      // TCP probe — don't waste time on unreachable servers.
-      // 3s timeout — if TCP fails, xray likely won't work either.
-      try {
-        const net = require("net");
-        const probeResult = await new Promise<{ ok: boolean; latency: number }>((resolve) => {
-          const socket = new net.Socket();
-          const start = Date.now();
-          const t = setTimeout(() => { socket.destroy(); resolve({ ok: false, latency: 0 }); }, 3000);
-          socket.connect(cfg.port, cfg.host, () => {
-            clearTimeout(t);
-            socket.destroy();
-            resolve({ ok: true, latency: Date.now() - start });
-          });
-          socket.on("error", () => { clearTimeout(t); resolve({ ok: false, latency: 0 }); });
-        });
-        if (!probeResult.ok) {
-          log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — TCP unreachable, trying next`);
-          continue;
-        }
-        log.info(`Quick connect: ${cfg.host}:${cfg.port} reachable (${probeResult.latency}ms)`);
-      } catch (e: any) {
-        log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — TCP probe error: ${e?.message}, trying next`);
+    // A TCP handshake is only a cheap pre-check; successful VPN state below is
+    // still required. Some public configs may have become unreachable since
+    // the free-engine probe, so continue to the next config on failure.
+    try {
+      const net = require("net");
+      const probeResult = await new Promise<{ ok: boolean; latency: number }>((resolve) => {
+        const socket = new net.Socket();
+        const start = Date.now();
+        let settled = false;
+        const finish = (result: { ok: boolean; latency: number }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(t);
+          socket.destroy();
+          resolve(result);
+        };
+        const t = setTimeout(() => finish({ ok: false, latency: 0 }), 3000);
+        socket.once("connect", () => finish({ ok: true, latency: Date.now() - start }));
+        socket.once("error", () => finish({ ok: false, latency: 0 }));
+        socket.connect(cfg.port, cfg.host);
+      });
+      if (!probeResult.ok) {
+        log.warn(\`Quick connect: \${cfg.host}:\${cfg.port} TCP pre-check failed; trying next config\`);
         continue;
       }
-
-      // Notify UI of attempt
-      mainWindow?.webContents.send("vpn:connecting", {
-        attempt: i + 1,
-        total: configs.length,
-        host: cfg.host,
-        protocol: cfg.protocol,
-      });
-
-      const server: VpnState["server"] = {
-        code: cfg.host,
-        country: cfg.country || cfg.host,
-        host: cfg.host,
-        port: cfg.port,
-      };
-
-      // Disable kill switch before attempting (from previous failed try)
-      await disableKillSwitch();
-
-      try {
-        await startVpnEngine(server, cfg.protocol, cfg.uri);
-
-        // Wait for verification (startVpnEngine does this internally with 5s timeout)
-        // Check if connected after 7 seconds (5s verification + 2s buffer)
-        await new Promise((r) => setTimeout(r, 7000));
-
-        const vpnState = store.get("vpn");
-        if (vpnState.connected) {
-          log.info(`Quick connect: SUCCESS on attempt ${i + 1} — connected via ${cfg.host} (${cfg.source})`);
-
-          // Cache this working config for offline use (national internet
-          // scenario — subscription URL may be unreachable). Two caches:
-          //   1. last-working-config.json  — single most-recently-working
-          //                                  config (used by the all-failed
-          //                                  fallback below).
-          //   2. cached-configs.json        — already written above with the
-          //                                  full list. The working config is
-          //                                  at index i in that list — when
-          //                                  the next launch reads it, the
-          //                                  list will already include the
-          //                                  working config (so the loop will
-          //                                  try it first if it's still at
-          //                                  the top).
-          try {
-            const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
-            fs.writeFileSync(cacheFile, JSON.stringify({
-              uri: cfg.uri,
-              protocol: cfg.protocol,
-              host: cfg.host,
-              port: cfg.port,
-              country: cfg.country,
-              timestamp: Date.now(),
-            }));
-            log.info(`Quick connect: cached working config to ${cacheFile}`);
-          } catch {}
-
-          return; // Success!
-        } else {
-          log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — startVpnEngine did not verify, trying next`);
-          await stopVpnEngine();
-        }
-      } catch (e: any) {
-        log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — startVpnEngine error: ${e?.message}, trying next`);
-        await stopVpnEngine();
-      }
+      log.info(\`Quick connect: \${cfg.host}:\${cfg.port} TCP reachable (\${probeResult.latency}ms)\`);
+    } catch (e: any) {
+      log.warn(\`Quick connect: TCP pre-check error for \${cfg.host}:\${cfg.port}: \${e?.message}; trying next\`);
+      continue;
     }
 
-    // ---------------------------------------------------------------------
-    // All configs in the list failed. As a final last-resort, try the
-    // most-recently-working cached config (national-internet scenario where
-    // the configs we just tried were all unreachable but a previous session's
-    // working config might still be alive).
-    // ---------------------------------------------------------------------
-    log.warn(`Quick connect: all ${configs.length} configs failed (attempts=${attempts}, MIN_ATTEMPTS=${MIN_ATTEMPTS}) — trying last-working-config.json`);
+    mainWindow?.webContents.send("vpn:connecting", {
+      attempt: attemptedUris.size,
+      total: configs.length,
+      host: cfg.host,
+      protocol: cfg.protocol,
+    });
+
+    const server: VpnState["server"] = {
+      code: cfg.host,
+      country: cfg.country || cfg.host,
+      host: cfg.host,
+      port: cfg.port,
+    };
+
+    try {
+      await disableKillSwitch();
+      await startVpnEngine(server, cfg.protocol, cfg.uri);
+
+      // startVpnEngine performs pre-flight validation; wait for the state
+      // machine to verify the tunnel before considering this config successful.
+      await new Promise((resolve) => setTimeout(resolve, 7000));
+      const vpnState = store.get("vpn");
+
+      if (vpnState.connected) {
+        log.info(\`Quick connect: SUCCESS — \${cfg.host} via \${cfg.source}\`);
+
+        try {
+          const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
+          fs.writeFileSync(cacheFile, JSON.stringify({
+            uri: cfg.uri,
+            protocol: cfg.protocol,
+            host: cfg.host,
+            port: cfg.port,
+            country: cfg.country,
+            timestamp: Date.now(),
+          }));
+        } catch {}
+
+        // Preserve offline fallback data until a config has actually worked.
+        // Put the known-good config first for the next launch.
+        const remaining = configs.filter((candidate) => candidate.uri !== cfg.uri);
+        writeCachedConfigs([cfg, ...remaining]);
+        return true;
+      }
+
+      log.warn(\`Quick connect: Xray did not verify a tunnel through \${cfg.host}; trying next\`);
+      await stopVpnEngine();
+    } catch (e: any) {
+      log.warn(\`Quick connect: Xray failed for \${cfg.host}:\${cfg.port}: \${e?.message}; trying next\`);
+      await stopVpnEngine().catch(() => {});
+    }
+  }
+
+  return false;
+}
+
+async function quickConnect(): Promise<void> {
+  try {
+    checkFreeEngineFreshness();
+    const attemptedUris = new Set<string>();
+
+    // Important: advance to the next source after the current source's
+    // configs have actually failed, not only when the current list is empty.
+    log.info("Quick connect: [1/5] fetching free-engine best.txt");
+    const bestConfigs = await fetchFreeEngineBest();
+    fetchFreeEngineStatus().catch(() => {});
+    if (await tryQuickConnectTier(bestConfigs, attemptedUris)) return;
+
+    log.info("Quick connect: [2/5] best.txt exhausted; fetching free-engine all.txt");
+    const allConfigs = await fetchFreeEngineAll();
+    if (await tryQuickConnectTier(allConfigs, attemptedUris)) return;
+
+    log.info("Quick connect: [3/5] free-engine configs exhausted; trying local DB");
+    let localConfigs = await fetchLocalDbConfigs();
+    if (await tryQuickConnectTier(localConfigs, attemptedUris)) return;
+
+    log.info("Quick connect: [3a/5] local DB configs exhausted; refreshing subscriptions");
+    localConfigs = await refreshSubscriptionsAndFetchConfigs();
+    if (await tryQuickConnectTier(localConfigs, attemptedUris)) return;
+
+    log.info("Quick connect: [4/5] live engine and DB configs exhausted; fetching mixed_iran.txt");
+    const mixedConfigs = await fetchMixedIranDirect();
+    if (await tryQuickConnectTier(mixedConfigs, attemptedUris)) return;
+
+    log.info("Quick connect: [5/5] live sources exhausted; trying cached-configs.json");
+    const cachedConfigs = readCachedConfigs();
+    if (await tryQuickConnectTier(cachedConfigs, attemptedUris)) return;
+
+    // Final last-resort: the last single config that was previously verified.
+    log.warn("Quick connect: all source lists exhausted; trying last-working-config.json");
     try {
       const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
       if (fs.existsSync(cacheFile)) {
         const cached = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
-        log.info(`Quick connect: trying cached config from ${new Date(cached.timestamp).toISOString()}: ${cached.host}`);
-
-        const server: VpnState["server"] = {
-          code: cached.host,
-          country: cached.country || cached.host,
-          host: cached.host,
-          port: cached.port,
-        };
-
-        await disableKillSwitch();
-        await startVpnEngine(server, cached.protocol, cached.uri);
-
-        await new Promise((r) => setTimeout(r, 7000));
-        const vpnState = store.get("vpn");
-        if (vpnState.connected) {
-          log.info("Quick connect: SUCCESS with cached offline config");
-          return;
+        if (typeof cached.uri === "string" && cached.uri.length > 10) {
+          const lastWorking: QuickConfig = {
+            uri: cached.uri,
+            protocol: cached.protocol,
+            host: cached.host,
+            port: cached.port,
+            country: cached.country,
+            source: "last-working-config.json",
+          };
+          // Use a fresh set so the previously working config can be retried
+          // even if it appeared in one of the failed lists.
+          if (await tryQuickConnectTier([lastWorking], new Set<string>())) return;
         }
       }
     } catch (e: any) {
-      log.warn(`Quick connect: cached config also failed: ${e?.message}`);
+      log.warn(\`Quick connect: last-working config fallback failed: \${e?.message}\`);
     }
 
-    log.error("Quick connect: ALL configs failed — cannot connect");
-    mainWindow?.webContents.send("vpn:error",
-      "All VPN configs failed. The network may be heavily filtered. Try again later or import a new config."
+    log.error("Quick connect: ALL sources and configs failed — cannot connect");
+    mainWindow?.webContents.send(
+      "vpn:error",
+      "All VPN configs failed after trying free-engine best/all, local DB, refreshed subscriptions, mixed_iran.txt, cached configs, and the last working config. Try again later or import a new config.",
     );
   } catch (e: any) {
     log.error("Quick connect failed:", e?.message || e);
-    mainWindow?.webContents.send("vpn:error", `Quick connect failed: ${e?.message || "unknown error"}`);
+    mainWindow?.webContents.send("vpn:error", \`Quick connect failed: \${e?.message || "unknown error"}\`);
   }
 }
 
