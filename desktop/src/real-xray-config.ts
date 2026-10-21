@@ -167,6 +167,7 @@ export function buildRealXrayConfig(cfg: RealServerConfig, opts?: { tun?: boolea
     port: httpPort,
     listen: "127.0.0.1",
     protocol: "http",
+    settings: {},
     sniffing: { enabled: true },
   });
 
@@ -193,11 +194,8 @@ export function buildRealXrayConfig(cfg: RealServerConfig, opts?: { tun?: boolea
       { tag: "dns-out", protocol: "dns" },
     ],
     routing: {
-      domainStrategy: "IPIfNonMatch",
-      rules: [
-        { type: "field", domain: ["geosite:category-ads-all"], outboundTag: "block" },
-        { type: "field", ip: ["geoip:private"], outboundTag: "block" },
-      ],
+      domainStrategy: "AsIs",
+      rules: [],
     },
   };
 }
@@ -301,13 +299,13 @@ function buildStreamSettings(cfg: RealServerConfig): any {
     };
   } else if (cfg.security === "reality") {
     ss.security = "reality";
-    ss.realitySettings = {
+    const realitySettings: any = {
       serverName: cfg.sni || "",
       publicKey: cfg.pbk || "", // REAL reality public key
       shortId: cfg.sid || "",
       fingerprint: cfg.fp || "chrome",
-      spiderX: "",
     };
+    ss.realitySettings = realitySettings;
   } else {
     ss.security = "none";
   }
