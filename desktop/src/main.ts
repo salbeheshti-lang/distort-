@@ -386,6 +386,7 @@ function buildXrayConfig(server: VpnState["server"], protocol: string, configUri
 }
 
 import { randomUUID as cryptoRandomUUID } from "crypto";
+import { parseConfigUri } from "./config-parser";
 
 // ---------------------------------------------------------------------------
 // Tunnel traffic verification — top-level (reused by both the desktop UI's
@@ -1264,120 +1265,368 @@ async function disableKillSwitch(): Promise<void> {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Free-engine helpers — fetch the GitHub-published curated config lists.
+// The free-engine GitHub Actions workflow writes best.txt / all.txt /
+// status.json to public/free-engine/ on every scheduled run (every 6h).
+// The desktop app caches status.json to userData so it can warn (not block)
+// when the local copy is stale.
+// -----------------------------------------------------------------------------
+
+const FREE_ENGINE_BASE_URL =
+  "https://raw.githubusercontent.com/salbeheshti-lang/distort-/main/public/free-engine";
+const FREE_ENGINE_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+type QuickConfig = {
+  protocol: string;
+  host: string;
+  port: number;
+  uri: string;
+  country?: string;
+  flags?: string;
+  score?: number;
+  source: string; // for logging — where this config came from
+};
+
+// Fetch best.txt (top 50 reachable configs from GitHub Actions probe).
+// Returns parsed configs. Empty list on any failure.
+async function fetchFreeEngineBest(): Promise<QuickConfig[]> {
+  const url = `${FREE_ENGINE_BASE_URL}/best.txt`;
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "DISTORT/1.0" },
+    });
+    if (!res.ok) {
+      log.warn(`Quick connect: best.txt fetch returned HTTP ${res.status}`);
+      return [];
+    }
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 10);
+    log.info(`Quick connect: best.txt — ${lines.length} URIs from free-engine`);
+    return linesToQuickConfigs(lines, "best.txt");
+  } catch (e: any) {
+    log.warn(`Quick connect: best.txt fetch failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Fetch all.txt (ALL parsed configs, reachable first).
+async function fetchFreeEngineAll(): Promise<QuickConfig[]> {
+  const url = `${FREE_ENGINE_BASE_URL}/all.txt`;
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(20000),
+      headers: { "User-Agent": "DISTORT/1.0" },
+    });
+    if (!res.ok) {
+      log.warn(`Quick connect: all.txt fetch returned HTTP ${res.status}`);
+      return [];
+    }
+    const text = await res.text();
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 10);
+    log.info(`Quick connect: all.txt — ${lines.length} URIs from free-engine`);
+    return linesToQuickConfigs(lines, "all.txt");
+  } catch (e: any) {
+    log.warn(`Quick connect: all.txt fetch failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Convert raw URI lines into the QuickConfig shape the failover loop expects.
+function linesToQuickConfigs(lines: string[], source: string): QuickConfig[] {
+  const out: QuickConfig[] = [];
+  for (const line of lines) {
+    const parsed = parseConfigUri(line);
+    if (!parsed || !parsed.host || !parsed.port || parsed.port <= 0) continue;
+    out.push({
+      protocol: parsed.protocol,
+      host: parsed.host,
+      port: parsed.port,
+      uri: parsed.raw,
+      country: parsed.country,
+      flags: parsed.flags.join(","),
+      score: parsed.score,
+      source,
+    });
+  }
+  return out;
+}
+
+// Fetch + cache status.json. Returns the parsed status, or null if unavailable.
+// Also writes the fetched status to userData so the next launch can check
+// freshness without re-fetching (national internet scenario).
+async function fetchFreeEngineStatus(): Promise<{ generatedAtEpoch: number } | null> {
+  const url = `${FREE_ENGINE_BASE_URL}/status.json`;
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": "DISTORT/1.0" },
+    });
+    if (!res.ok) return null;
+    const json = await res.json() as any;
+    if (!json || typeof json.generatedAtEpoch !== "number") return null;
+    // Cache to userData for the next launch's freshness check.
+    try {
+      const cacheFile = path.join(app.getPath("userData"), "free-engine-status.json");
+      fs.writeFileSync(cacheFile, JSON.stringify(json));
+    } catch {}
+    return { generatedAtEpoch: json.generatedAtEpoch };
+  } catch {
+    return null;
+  }
+}
+
+// Read the locally-cached status.json (written by a previous launch's
+// fetchFreeEngineStatus call). Returns null if missing or unparseable.
+function readCachedFreeEngineStatus(): { generatedAtEpoch: number } | null {
+  try {
+    const cacheFile = path.join(app.getPath("userData"), "free-engine-status.json");
+    if (!fs.existsSync(cacheFile)) return null;
+    const json = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+    if (!json || typeof json.generatedAtEpoch !== "number") return null;
+    return { generatedAtEpoch: json.generatedAtEpoch };
+  } catch {
+    return null;
+  }
+}
+
+// Check freshness of the locally-cached status.json. Logs a warning if it's
+// older than FREE_ENGINE_STALE_MS or missing — but does NOT block the
+// connection (the user may be in a national-internet scenario where the
+// GitHub raw URL is unreachable).
+function checkFreeEngineFreshness(): void {
+  const cached = readCachedFreeEngineStatus();
+  if (!cached) {
+    log.warn("Quick connect: no cached free-engine status.json — freshness unknown (first launch or cache cleared)");
+    return;
+  }
+  const ageMs = Date.now() - cached.generatedAtEpoch;
+  if (ageMs > FREE_ENGINE_STALE_MS) {
+    const ageH = (ageMs / (60 * 60 * 1000)).toFixed(1);
+    log.warn(`Quick connect: free-engine status.json is ${ageH}h old (stale > 6h) — will still try best.txt`);
+  } else {
+    const ageH = (ageMs / (60 * 60 * 1000)).toFixed(1);
+    log.info(`Quick connect: free-engine status.json is ${ageH}h old (fresh)`);
+  }
+}
+
+// Fetch configs from the local DB via the bundled Next.js API.
+// limit=100 so the failover loop has plenty to try.
+async function fetchLocalDbConfigs(): Promise<QuickConfig[]> {
+  try {
+    const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=100`;
+    const meshRes = await fetch(meshUrl);
+    if (!meshRes.ok) {
+      log.warn(`Quick connect: /api/imported-configs returned HTTP ${meshRes.status}`);
+      return [];
+    }
+    const meshData: any = await meshRes.json() as any;
+    const configs = (meshData?.configs || []).map((c: any) => ({
+      protocol: c.protocol,
+      host: c.host,
+      port: c.port,
+      uri: c.uri,
+      country: c.country,
+      flags: c.flags,
+      score: c.score,
+      source: "local-db",
+    })) as QuickConfig[];
+    log.info(`Quick connect: local DB — ${configs.length} configs from /api/imported-configs`);
+    return configs;
+  } catch (e: any) {
+    log.warn(`Quick connect: local DB fetch failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Refresh all configured subscriptions, then return configs from the DB.
+// Used as the fallback BEFORE going to mixed_iran.txt directly.
+async function refreshSubscriptionsAndFetchConfigs(): Promise<QuickConfig[]> {
+  try {
+    const subResp = await fetch(`${getLoadUrl()}/api/subscriptions`);
+    if (!subResp.ok) return [];
+    const subData: any = await subResp.json() as any;
+    const subs = subData.subscriptions || [];
+    for (const sub of subs) {
+      log.info(`Quick connect: refreshing subscription "${sub.label}"`);
+      const refreshResp = await fetch(`${getLoadUrl()}/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
+      if (refreshResp.ok) {
+        const refreshData: any = await refreshResp.json() as any;
+        log.info(`Quick connect: subscription refreshed — ${refreshData.count || 0} configs`);
+      }
+    }
+    return await fetchLocalDbConfigs();
+  } catch (e: any) {
+    log.warn(`Quick connect: subscription refresh failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Fetch mixed_iran.txt directly from the upstream GitHub source — guaranteed
+// fallback when all other sources are unavailable.
+async function fetchMixedIranDirect(): Promise<QuickConfig[]> {
+  const subUrl = "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt";
+  try {
+    const subRes = await fetch(subUrl, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "DISTORT/1.0" },
+    });
+    if (!subRes.ok) {
+      log.warn(`Quick connect: mixed_iran.txt fetch returned HTTP ${subRes.status}`);
+      return [];
+    }
+    const text = await subRes.text();
+    const lines = text.split(/\r?\n/).map((l: string) => l.trim()).filter((l: string) => l.length > 10);
+    log.info(`Quick connect: mixed_iran.txt — ${lines.length} lines fetched directly`);
+    // Best-effort import to DB so they appear in the Connect dropdown.
+    // Non-fatal — the loop below uses the parsed configs directly.
+    importConfigsInBackground(lines);
+    return linesToQuickConfigs(lines, "mixed_iran.txt");
+  } catch (e: any) {
+    log.warn(`Quick connect: mixed_iran.txt direct fetch failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Background-fire-and-forget: bulk-import a list of raw config lines into the
+// local DB so they appear in the Connect dropdown next time. Errors are
+// swallowed because the failover loop already has the parsed configs in
+// memory — this just enriches the UI for next time.
+function importConfigsInBackground(lines: string[]): void {
+  // Coalesce into a single bulk import (the API handles multi-line input).
+  const text = lines.join("\n");
+  fetch(`${getLoadUrl()}/api/imported-configs/import`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ raw: text, source: "quick-connect-fallback" }),
+  }).catch(() => {});
+}
+
+// Read cached configs from disk (offline / national-internet fallback).
+function readCachedConfigs(): QuickConfig[] {
+  try {
+    const cacheFile = path.join(app.getPath("userData"), "cached-configs.json");
+    if (!fs.existsSync(cacheFile)) return [];
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
+    const configs = (cached.configs || []).map((c: any) => ({
+      protocol: c.protocol,
+      host: c.host,
+      port: c.port,
+      uri: c.uri,
+      country: c.country,
+      flags: c.flags,
+      score: c.score,
+      source: "cached-configs.json",
+    })) as QuickConfig[];
+    log.info(`Quick connect: cached-configs.json — ${configs.length} configs (offline mode)`);
+    return configs;
+  } catch (e: any) {
+    log.warn(`Quick connect: cache read failed: ${e?.message}`);
+    return [];
+  }
+}
+
+// Cache the list of configs that we're about to try, so the next launch's
+// Fallback 4 (cached-configs.json) has them. Called BEFORE the failover loop.
+function writeCachedConfigs(configs: QuickConfig[]): void {
+  try {
+    const cacheFile = path.join(app.getPath("userData"), "cached-configs.json");
+    fs.writeFileSync(cacheFile, JSON.stringify({
+      configs,
+      timestamp: Date.now(),
+    }));
+  } catch {}
+}
+
 async function quickConnect(): Promise<void> {
   try {
-    // Step 1: Get configs from API
-    let configs: any[] = [];
-    try {
-      const meshUrl = `${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`;
-      const meshRes = await fetch(meshUrl);
-      if (meshRes.ok) {
-        const meshData: any = await meshRes.json() as any;
-        configs = meshData?.configs || [];
-        log.info(`Quick connect: fetched ${configs.length} configs from API`);
-      } else {
-        log.warn(`Quick connect: API returned ${meshRes.status}, trying alternatives`);
-      }
-    } catch (e: any) {
-      log.warn(`Quick connect: API fetch failed (${e?.message}), trying alternatives`);
+    // ---------------------------------------------------------------------
+    // Free-engine freshness check (Phase 4.2). Non-blocking — logs a warning
+    // if the locally-cached status.json is missing or stale (>6h old).
+    // ---------------------------------------------------------------------
+    checkFreeEngineFreshness();
+
+    // ---------------------------------------------------------------------
+    // Failover chain (Phase 4.1):
+    //   1. Free-engine best.txt  — GitHub-curated top-50 reachable configs
+    //   2. Free-engine all.txt   — ALL parsed configs (reachable first)
+    //   3. Local DB               — /api/imported-configs (user imports + default Iran sub)
+    //   3a. Subscription refresh  — if DB is empty, refresh + retry
+    //   4. mixed_iran.txt direct  — guaranteed upstream fallback
+    //   5. cached-configs.json    — offline / national-internet fallback
+    // ---------------------------------------------------------------------
+
+    let configs: QuickConfig[] = [];
+
+    // Step 1: Free-engine best.txt
+    if (configs.length === 0) {
+      log.info("Quick connect: [1/5] trying free-engine best.txt");
+      configs = await fetchFreeEngineBest();
+      // Best-effort: also fetch + cache status.json so the next launch has
+      // an up-to-date freshness timestamp. Non-blocking.
+      fetchFreeEngineStatus().catch(() => {});
     }
 
-    // Step 2: If no configs from API, try refreshing subscription directly
+    // Step 2: Free-engine all.txt (fallback if best.txt is empty/unreachable)
     if (configs.length === 0) {
-      log.info("Quick connect: no configs from API — refreshing Iran subscription directly");
-      try {
-        const subResp = await fetch(`${getLoadUrl()}/api/subscriptions`);
-        if (subResp.ok) {
-          const subData: any = await subResp.json() as any;
-          const subs = subData.subscriptions || [];
-          for (const sub of subs) {
-            log.info(`Quick connect: refreshing subscription "${sub.label}"`);
-            const refreshResp = await fetch(`${getLoadUrl()}/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
-            if (refreshResp.ok) {
-              const refreshData: any = await refreshResp.json() as any;
-              log.info(`Quick connect: subscription refreshed — ${refreshData.count || 0} configs`);
-            }
-          }
-          // Now try fetching configs again
-          const meshRes2 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
-          if (meshRes2.ok) {
-            const meshData2: any = await meshRes2.json() as any;
-            configs = meshData2?.configs || [];
-            log.info(`Quick connect: after refresh, fetched ${configs.length} configs`);
-          }
-        }
-      } catch (e: any) {
-        log.warn(`Quick connect: subscription refresh failed: ${e?.message}`);
-      }
+      log.info("Quick connect: [2/5] best.txt empty/unreachable — trying all.txt");
+      configs = await fetchFreeEngineAll();
     }
 
-    // Step 3: If still no configs, fetch mixed_iran.txt DIRECTLY (guaranteed fallback)
+    // Step 3: Local DB (user imports + default Iran subscription)
     if (configs.length === 0) {
-      log.info("Quick connect: no configs from API — fetching mixed_iran.txt directly");
-      try {
-        const subUrl = "https://raw.githubusercontent.com/miladtahanian/Config-Collector/main/mixed_iran.txt";
-        const subRes = await fetch(subUrl, {
-          signal: AbortSignal.timeout(15000),
-          headers: { "User-Agent": "DISTORT/1.0" },
-        });
-        if (subRes.ok) {
-          const text = await subRes.text();
-          const lines = text.split("\n").map((l: string) => l.trim()).filter((l: string) => l.length > 10);
-          log.info(`Quick connect: fetched ${lines.length} lines from mixed_iran.txt`);
-          // Parse each line and add to configs
-          for (const line of lines) {
-            try {
-              // Import via API
-              await fetch(`${getLoadUrl()}/api/imported-configs/import`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ text: line }),
-              });
-            } catch {}
-          }
-          // Now fetch optimized configs
-          const meshRes3 = await fetch(`${getLoadUrl()}/api/imported-configs?bucket=optimized&limit=20`);
-          if (meshRes3.ok) {
-            const meshData3: any = await meshRes3.json() as any;
-            configs = meshData3?.configs || [];
-            log.info(`Quick connect: after direct fetch, got ${configs.length} configs`);
-          }
-        }
-      } catch (e: any) {
-        log.warn(`Quick connect: direct mixed_iran.txt fetch failed: ${e?.message}`);
-      }
+      log.info("Quick connect: [3/5] free-engine lists empty — trying local DB");
+      configs = await fetchLocalDbConfigs();
     }
 
-    // Step 4: Last resort — try cached configs
+    // Step 3a: Refresh subscriptions + retry local DB (only if 3 was empty)
     if (configs.length === 0) {
-      try {
-        const cacheFile = path.join(app.getPath("userData"), "cached-configs.json");
-        if (fs.existsSync(cacheFile)) {
-          const cached = JSON.parse(fs.readFileSync(cacheFile, "utf-8"));
-          configs = cached.configs || [];
-          log.info(`Quick connect: using ${configs.length} cached configs (offline mode)`);
-        }
-      } catch (e: any) {
-        log.warn(`Quick connect: cache read failed: ${e?.message}`);
-      }
+      log.info("Quick connect: [3a/5] local DB empty — refreshing subscriptions then retry");
+      configs = await refreshSubscriptionsAndFetchConfigs();
+    }
+
+    // Step 4: mixed_iran.txt direct (guaranteed upstream fallback)
+    if (configs.length === 0) {
+      log.info("Quick connect: [4/5] local DB still empty — fetching mixed_iran.txt directly");
+      configs = await fetchMixedIranDirect();
+    }
+
+    // Step 5: Cached configs from disk (national-internet / offline scenario)
+    if (configs.length === 0) {
+      log.info("Quick connect: [5/5] all live sources failed — using cached-configs.json");
+      configs = readCachedConfigs();
     }
 
     if (configs.length === 0) {
-      log.error("Quick connect: no configs available after all attempts");
+      log.error("Quick connect: no configs available after all 5 fallback sources");
       mainWindow?.webContents.send("vpn:error",
-        "No VPN configs available. All sources failed: API, subscription refresh, direct fetch, and cache."
+        "No VPN configs available. All sources failed: free-engine (best.txt + all.txt), local DB, subscription refresh, mixed_iran.txt, and cached-configs.json."
       );
       return;
     }
 
-    log.info(`Quick connect: trying ${configs.length} configs in sequence (auto-failover)`);
+    // Cache the full list to cached-configs.json so the next launch (offline
+    // scenario) has them as Fallback 5.
+    writeCachedConfigs(configs);
 
-    // Try each config until one connects successfully
+    log.info(`Quick connect: trying ${configs.length} configs in sequence (auto-failover) — will try at least 10 before giving up`);
+
+    // ---------------------------------------------------------------------
+    // Failover loop — try each config until one connects successfully via
+    // xray. We do NOT give up until we've tried min(10, configs.length)
+    // configs, OR all of them.
+    // ---------------------------------------------------------------------
+    const MIN_ATTEMPTS = Math.min(10, configs.length);
+    let attempts = 0;
+
     for (let i = 0; i < configs.length; i++) {
       const cfg = configs[i];
-      log.info(`Quick connect: attempt ${i + 1}/${configs.length} — ${cfg.protocol} ${cfg.host}:${cfg.port} (${cfg.flags || 'no flags'})`);
+      attempts++;
+      log.info(`Quick connect: attempt ${i + 1}/${configs.length} (src=${cfg.source}) — ${cfg.protocol} ${cfg.host}:${cfg.port} (${cfg.flags || 'no flags'})`);
 
-      // TCP probe — don't waste time on unreachable servers
+      // TCP probe — don't waste time on unreachable servers.
+      // 3s timeout — if TCP fails, xray likely won't work either.
       try {
         const net = require("net");
         const probeResult = await new Promise<{ ok: boolean; latency: number }>((resolve) => {
@@ -1392,12 +1641,12 @@ async function quickConnect(): Promise<void> {
           socket.on("error", () => { clearTimeout(t); resolve({ ok: false, latency: 0 }); });
         });
         if (!probeResult.ok) {
-          log.warn(`Quick connect: ${cfg.host}:${cfg.port} unreachable (TCP probe failed) — skipping`);
+          log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — TCP unreachable, trying next`);
           continue;
         }
         log.info(`Quick connect: ${cfg.host}:${cfg.port} reachable (${probeResult.latency}ms)`);
       } catch (e: any) {
-        log.warn(`Quick connect: TCP probe error: ${e?.message} — skipping`);
+        log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — TCP probe error: ${e?.message}, trying next`);
         continue;
       }
 
@@ -1428,10 +1677,21 @@ async function quickConnect(): Promise<void> {
 
         const vpnState = store.get("vpn");
         if (vpnState.connected) {
-          log.info(`Quick connect: SUCCESS on attempt ${i + 1} — connected via ${cfg.host}`);
+          log.info(`Quick connect: SUCCESS on attempt ${i + 1} — connected via ${cfg.host} (${cfg.source})`);
 
-          // Step 3: Cache this working config for offline use
-          // (national internet scenario — subscription URL may be unreachable)
+          // Cache this working config for offline use (national internet
+          // scenario — subscription URL may be unreachable). Two caches:
+          //   1. last-working-config.json  — single most-recently-working
+          //                                  config (used by the all-failed
+          //                                  fallback below).
+          //   2. cached-configs.json        — already written above with the
+          //                                  full list. The working config is
+          //                                  at index i in that list — when
+          //                                  the next launch reads it, the
+          //                                  list will already include the
+          //                                  working config (so the loop will
+          //                                  try it first if it's still at
+          //                                  the top).
           try {
             const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
             fs.writeFileSync(cacheFile, JSON.stringify({
@@ -1447,17 +1707,22 @@ async function quickConnect(): Promise<void> {
 
           return; // Success!
         } else {
-          log.warn(`Quick connect: attempt ${i + 1} failed — trying next config`);
+          log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — startVpnEngine did not verify, trying next`);
           await stopVpnEngine();
         }
       } catch (e: any) {
-        log.warn(`Quick connect: attempt ${i + 1} error: ${e?.message} — trying next`);
+        log.warn(`Quick connect: config ${i + 1} failed (${cfg.host}:${cfg.port}) — startVpnEngine error: ${e?.message}, trying next`);
         await stopVpnEngine();
       }
     }
 
-    // All configs failed — try cached offline config (national internet scenario)
-    log.warn("Quick connect: all Community Mesh configs failed — trying cached offline config");
+    // ---------------------------------------------------------------------
+    // All configs in the list failed. As a final last-resort, try the
+    // most-recently-working cached config (national-internet scenario where
+    // the configs we just tried were all unreachable but a previous session's
+    // working config might still be alive).
+    // ---------------------------------------------------------------------
+    log.warn(`Quick connect: all ${configs.length} configs failed (attempts=${attempts}, MIN_ATTEMPTS=${MIN_ATTEMPTS}) — trying last-working-config.json`);
     try {
       const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
       if (fs.existsSync(cacheFile)) {

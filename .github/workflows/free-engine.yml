@@ -1,0 +1,65 @@
+name: Free Engine — Gather + Probe + Publish Configs
+on:
+  schedule:
+    # Every 6 hours at minute 0 — refreshes best.txt / all.txt / status.json
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/free-engine.ts'
+      - '.github/workflows/free-engine.yml'
+      - 'src/lib/config-parser.ts'
+      - 'src/lib/anti-censor.ts'
+
+permissions:
+  contents: write  # Required for git-auto-commit-action to push files back to the repo
+
+concurrency:
+  group: free-engine
+  cancel-in-progress: false
+
+jobs:
+  gather-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run free-engine script
+        run: bun run scripts/free-engine.ts
+        env:
+          # The script writes to public/free-engine/ by default.
+          # GitHub Actions runners can fetch external URLs without restriction.
+          FREE_ENGINE_OUT_DIR: public/free-engine
+
+      - name: Verify outputs exist
+        run: |
+          set -e
+          for f in best.txt all.txt status.json; do
+            if [ ! -f "public/free-engine/$f" ]; then
+              echo "ERROR: public/free-engine/$f was not produced"
+              exit 1
+            fi
+            echo "✓ public/free-engine/$f ($(wc -c < public/free-engine/$f) bytes)"
+          done
+          # Show a quick status summary for the workflow log
+          echo "--- status.json summary ---"
+          cat public/free-engine/status.json | head -40
+
+      - name: Commit + push outputs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "free-engine: refresh configs (scheduled)"
+          file_pattern: "public/free-engine/*.txt public/free-engine/*.json"
+          commit_user_name: "distort-free-engine[bot]"
+          commit_user_email: "actions@github.com"
