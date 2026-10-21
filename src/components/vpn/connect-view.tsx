@@ -1,31 +1,96 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+// DISTORT — ConnectView (single hub for everything)
+//
+// Replaces the legacy "Distort Config" tab + minimal Connect dropdown with
+// one unified view:
+//   - Default Iran configs (mixed_iran.txt subscription, bucket=optimized)
+//   - Personal configs imported via the `+` button (favorite=true OR
+//     subscription.kind==="manual")
+//   - Live latency badges next to each dropdown item
+//   - "Test all" button → POST /api/imported-configs/check (server probes
+//     in parallel, returns {results:[{id,host,port,ok,latencyMs}]})
+//   - Auto-selects the lowest-latency reachable config after Test all runs
+//     (only if the user hasn't manually picked one).
+//
+// Persian UX requirement honoured:
+//   "اگه + زده شد که کانفیگ شخصی کار کنه ، باید یک اجرای فوق العاده داشته باشه"
+//   → Import button opens a clean modal (ImportDialog in import-config-dialog.tsx)
+//     with live preview + structured-error surfacing via postJSONSoft.
+//     No clutter, generous spacing, smooth animations.
+
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Power, Shield, Zap, Activity, Radio, RefreshCw,
-  ChevronDown, Check, Download, Upload, Clock, Wifi,
-  AlertCircle, Settings2, Crown
+  Power,
+  Activity,
+  RefreshCw,
+  ChevronDown,
+  Check,
+  Download,
+  Upload,
+  Clock,
+  AlertCircle,
+  Plus,
+  Star,
 } from "lucide-react";
-import { useVpnStore, formatRate, formatBytes, formatDuration, type ServerLite } from "@/lib/vpn-store";
-import { postJSON, useFetch } from "@/hooks/use-fetch";
+import {
+  useVpnStore,
+  formatRate,
+  formatDuration,
+  type ServerLite,
+} from "@/lib/vpn-store";
+import { postJSON, postJSONSoft, useFetch } from "@/hooks/use-fetch";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { useAutoUpdate } from "@/hooks/use-auto-update";
 import { IpLocationWidget } from "./ip-location-widget";
+import { ImportDialog } from "./import-config-dialog";
 
-type IranConfig = {
+// Mirrors the ImportedConfig Prisma model joined with its subscription.
+// Moved here from the deleted community-mesh-view.tsx.
+type ImportedConfig = {
   id: string;
   protocol: string;
+  uri: string;
+  label: string | null;
   host: string;
   port: number;
+  network: string;
+  security: string;
+  sni: string | null;
+  path: string | null;
+  flow: string | null;
+  country: string | null;
   score: number;
   flags: string;
-  label: string | null;
-  country: string | null;
   reach: string;
   latencyMs: number;
+  bucket: string;
+  favorite: boolean;
+  checkedAt: string | null;
+  subscription: { label: string; kind: string } | null;
+};
+
+// Latency probe state keyed by config id.
+//   - testing: true while a probe is in-flight for this id
+//   - ok: true if the host:port is reachable
+//   - ms: round-trip in milliseconds (null when untested or unreachable)
+type LatencyState = { ms: number | null; ok: boolean; testing: boolean };
+
+// Reachability check API response shape (mirrors /api/imported-configs/check).
+type CheckResult = {
+  id: string;
+  host: string;
+  port: number;
+  ok: boolean;
+  latencyMs: number;
+};
+type CheckResponse = {
+  checked: number;
+  ok: number;
+  results: CheckResult[];
 };
 
 function pingColor(p: number) {
@@ -35,20 +100,49 @@ function pingColor(p: number) {
   return "#ff4d6d";
 }
 
+// A config is "personal" if EITHER the user favorited it (single-URI imports
+// are auto-favorited by /api/imported-configs/import) OR it was attached to
+// a manual-source subscription (bulk pastes via the + button).
+function isPersonal(c: ImportedConfig): boolean {
+  return c.favorite || c.subscription?.kind === "manual";
+}
+
 export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
-  const { state, currentServer, live, settings, connect, disconnect } = useVpnStore();
+  const { state, currentServer, live, settings, connect, disconnect } =
+    useVpnStore();
   const [now, setNow] = useState(Date.now());
   const [showConfigList, setShowConfigList] = useState(false);
-  const [selectedConfig, setSelectedConfig] = useState<IranConfig | null>(null);
+  const [selectedConfig, setSelectedConfig] = useState<ImportedConfig | null>(
+    null
+  );
   const [connecting, setConnecting] = useState(false);
+  // Live latency probes, populated by "Test all" (POST /api/imported-configs/check).
+  const [latencies, setLatencies] = useState<Record<string, LatencyState>>({});
+  const [testingAll, setTestingAll] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  // Tracks whether the user has manually picked a config — used to suppress
+  // the "auto-switch to best after Test all" effect.
+  const [userSelectedId, setUserSelectedId] = useState<string | null>(null);
 
-  // Fetch Iran configs
-  const { data: configData, loading: configsLoading, refetch: refetchConfigs } = useFetch<{ configs: IranConfig[] }>(
-    "/api/imported-configs?bucket=optimized&limit=10"
+  // Fetch BOTH default Iran configs (bucket=optimized) AND personal favorites
+  // (favorite=true) AND manual-source imports — all in one shot. The backend
+  // sorts by favorite DESC, score DESC, host ASC — so favorites bubble to the
+  // top of the response array already.
+  const {
+    data: configData,
+    loading: configsLoading,
+    refetch: refetchConfigs,
+  } = useFetch<{ configs: ImportedConfig[] }>(
+    "/api/imported-configs?limit=80"
   );
 
   // Auto-update
-  const { status: updateStatus, version: updateVersion, checkNow, isDesktop } = useAutoUpdate();
+  const {
+    status: updateStatus,
+    version: updateVersion,
+    checkNow,
+    isDesktop,
+  } = useAutoUpdate();
 
   useEffect(() => {
     if (state !== "connected") return;
@@ -56,37 +150,179 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     return () => clearInterval(t);
   }, [state]);
 
-  const elapsed = live.connectedSince ? Math.floor((now - live.connectedSince) / 1000) : 0;
+  const elapsed = live.connectedSince
+    ? Math.floor((now - live.connectedSince) / 1000)
+    : 0;
   const isConnected = state === "connected";
   const isConnecting = state === "connecting" || connecting;
 
-  // Auto-select first config
-  useEffect(() => {
-    if (!selectedConfig && configData?.configs?.length) {
-      const firstReachable = configData.configs.find(c => c.reach === "ok") || configData.configs[0];
-      setSelectedConfig(firstReachable);
-    }
-  }, [configData, selectedConfig]);
+  // ---- Sorted configs ----
+  // Sort order (lower score = earlier in list):
+  //   1. Personal configs that are reachable, by latency asc
+  //   2. Default configs that are reachable, by latency asc
+  //   3. Untested personal configs
+  //   4. Untested default configs
+  //   5. Personal configs that are currently being tested
+  //   6. Default configs that are currently being tested
+  //   7. Unreachable (personal first, then default)
+  const sortedConfigs = useMemo(() => {
+    const list = configData?.configs ?? [];
+    const score = (c: ImportedConfig): number => {
+      const lat = latencies[c.id];
+      const personalBoost = isPersonal(c) ? 0 : 1_000_000;
+      if (lat?.testing) {
+        // testing → very low priority, but above unreachable
+        return personalBoost + 5_000_000;
+      }
+      if (lat?.ok && lat.ms != null) {
+        // reachable — sort by ms ascending; offset by 0 so reachable always wins
+        return personalBoost + lat.ms;
+      }
+      if (lat?.ok === false) {
+        // unreachable — lowest priority
+        return personalBoost + 10_000_000;
+      }
+      // untested (no probe yet) — above unreachable, below reachable
+      return personalBoost + 2_000_000;
+    };
+    return [...list].sort((a, b) => score(a) - score(b));
+  }, [configData, latencies]);
 
+  // Initial auto-select — only runs if no config is selected AND the user
+  // hasn't manually picked one yet. Picks the first reachable (by latency) or
+  // falls back to sortedConfigs[0] if nothing has been probed yet.
+  useEffect(() => {
+    if (userSelectedId) return;
+    if (selectedConfig) return;
+    if (!sortedConfigs.length) return;
+    const reachable = sortedConfigs.find((c) => {
+      const lat = latencies[c.id];
+      return lat?.ok && lat.ms != null;
+    });
+    setSelectedConfig(reachable || sortedConfigs[0]);
+  }, [sortedConfigs, latencies, userSelectedId, selectedConfig]);
+
+  // Auto-switch to the best reachable config after Test all completes —
+  // only if the user hasn't manually picked one.
+  useEffect(() => {
+    if (userSelectedId) return;
+    if (testingAll) return;
+    const reachable = sortedConfigs.find((c) => {
+      const lat = latencies[c.id];
+      return lat?.ok && lat.ms != null;
+    });
+    if (reachable && reachable.id !== selectedConfig?.id) {
+      setSelectedConfig(reachable);
+    }
+  }, [testingAll, sortedConfigs, latencies, userSelectedId, selectedConfig]);
+
+  // ---- Test all configs (calls /api/imported-configs/check) ----
+  // Single API call → server probes ALL optimized configs in parallel
+  // (Promise.all in /api/imported-configs/check/route.ts). Returns a results
+  // array with {id, host, port, ok, latencyMs} per config.
+  const testAllConfigs = useCallback(async () => {
+    const list = configData?.configs ?? [];
+    if (!list.length) {
+      toast.info("No configs to test", {
+        description: "Refresh or import configs first.",
+      });
+      return;
+    }
+    setTestingAll(true);
+    // Mark every config as testing so the UI shows the gray spinner badge.
+    setLatencies((prev) => {
+      const next = { ...prev };
+      for (const c of list) {
+        next[c.id] = { ms: null, ok: false, testing: true };
+      }
+      return next;
+    });
+
+    try {
+      const r = await postJSONSoft<CheckResponse>(
+        "/api/imported-configs/check",
+        { limit: 50 }
+      );
+      if (!r.ok || !r.data) {
+        toast.error("Test failed", {
+          description: r.error ?? "Unknown error",
+        });
+        // Reset testing flags on failure
+        setLatencies((prev) => {
+          const next = { ...prev };
+          for (const c of list) {
+            if (next[c.id]?.testing) {
+              next[c.id] = { ms: null, ok: false, testing: false };
+            }
+          }
+          return next;
+        });
+        return;
+      }
+      const resultsMap = new Map<string, CheckResult>();
+      for (const res of r.data.results) resultsMap.set(res.id, res);
+      setLatencies((prev) => {
+        const next = { ...prev };
+        for (const c of list) {
+          const found = resultsMap.get(c.id);
+          if (found) {
+            next[c.id] = {
+              ms: found.latencyMs,
+              ok: found.ok,
+              testing: false,
+            };
+          } else {
+            // Config wasn't probed (e.g. bucket != optimized) — fall back to
+            // the server-side reach value from the GET /api/imported-configs
+            // response so the badge is still accurate.
+            next[c.id] = {
+              ms: c.latencyMs || null,
+              ok: c.reach === "ok",
+              testing: false,
+            };
+          }
+        }
+        return next;
+      });
+      const okCount = r.data.ok;
+      const total = r.data.checked;
+      toast.success("Reachability test done", {
+        description: `${okCount}/${total} reachable${
+          okCount > 0 ? " · best latency auto-selected" : ""
+        }`,
+      });
+    } catch (e) {
+      toast.error("Test failed", { description: (e as Error).message });
+    } finally {
+      setTestingAll(false);
+    }
+  }, [configData]);
+
+  // ---- Connect / disconnect handler ----
+  // (Unchanged from the previous version — only types + protocols array fix.)
   const handleToggle = async () => {
     if (state === "disconnected" || state === "error") {
       if (!selectedConfig) {
-        toast.error("No config selected", { description: "Refresh configs and try again." });
+        toast.error("No config selected", {
+          description: "Refresh configs and try again.",
+        });
         return;
       }
 
-      // Try real connection via companion API
       setConnecting(true);
       try {
-        // First, fetch the config URI
-        const uriResp = await fetch(`/api/emergency/candidates/${selectedConfig.id}/uri`, { method: "POST" });
+        // Step 1: fetch the config URI
+        const uriResp = await fetch(
+          `/api/emergency/candidates/${selectedConfig.id}/uri`,
+          { method: "POST" }
+        );
         if (!uriResp.ok) {
           throw new Error(`Failed to fetch config URI (${uriResp.status})`);
         }
         const uriData = await uriResp.json();
         const configUri = uriData.uri;
 
-        // Try to start tunnel via companion API
+        // Step 2: start xray via companion API
         const companionResp = await fetch("/api/tunnel/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -96,46 +332,57 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
         if (companionResp.ok) {
           const result = await companionResp.json();
           if (result.ok) {
-            // xray started — but we need to VERIFY it actually works
-            // Wait 3s for xray to fully initialize, then check tunnel status
-            toast.info("Starting tunnel…", { description: `${selectedConfig.protocol} → ${selectedConfig.host}:${selectedConfig.port}` });
+            toast.info("Starting tunnel…", {
+              description: `${selectedConfig.protocol} → ${selectedConfig.host}:${selectedConfig.port}`,
+            });
             await new Promise((r) => setTimeout(r, 3000));
 
-            // Check if xray is still running
             const statusResp = await fetch("/api/tunnel/status");
             if (statusResp.ok) {
               const statusData = await statusResp.json();
               if (statusData.running) {
-                // xray is running — now verify traffic actually flows
-                const verifyResp = await fetch("/api/tunnel/verify", { method: "POST" });
+                const verifyResp = await fetch("/api/tunnel/verify", {
+                  method: "POST",
+                });
                 if (verifyResp.ok) {
                   const verifyData = await verifyResp.json();
                   if (verifyData.trafficVerified) {
-                    // REAL verified connection!
-                    connect({
-                      id: selectedConfig.id,
-                      code: selectedConfig.host,
-                      country: selectedConfig.country || "Iran",
-                      city: selectedConfig.host,
-                      flag: "🇮🇷",
-                      host: selectedConfig.host,
-                      port: selectedConfig.port,
-                      protocols: selectedConfig.protocol,
-                      load: 0,
-                      ping: verifyData.latencyMs || 50,
-                      upMbps: 1000,
-                      downMbps: 1000,
-                      online: true,
-                      premium: false,
-                      stealth: true,
-                      note: selectedConfig.flags,
-                    } as ServerLite, selectedConfig.protocol);
-                    toast.success("Connected!", { description: `Exit IP: ${verifyData.exitIp}` });
+                    connect(
+                      {
+                        id: selectedConfig.id,
+                        code: selectedConfig.host,
+                        country: selectedConfig.country || "Iran",
+                        countryCode: "",
+                        city: selectedConfig.host,
+                        flag: "🇮🇷",
+                        host: selectedConfig.host,
+                        port: selectedConfig.port,
+                        protocols: [selectedConfig.protocol],
+                        load: 0,
+                        ping: verifyData.latencyMs || 50,
+                        upMbps: 1000,
+                        downMbps: 1000,
+                        online: true,
+                        premium: false,
+                        stealth: true,
+                        note: selectedConfig.flags,
+                      } as ServerLite,
+                      selectedConfig.protocol
+                    );
+                    toast.success("Connected!", {
+                      description: `Exit IP: ${verifyData.exitIp}`,
+                    });
                   } else {
-                    throw new Error(`Tunnel started but traffic verification failed: ${verifyData.error || "unknown"}`);
+                    throw new Error(
+                      `Tunnel started but traffic verification failed: ${
+                        verifyData.error || "unknown"
+                      }`
+                    );
                   }
                 } else {
-                  throw new Error("Tunnel started but verification endpoint failed");
+                  throw new Error(
+                    "Tunnel started but verification endpoint failed"
+                  );
                 }
               } else {
                 throw new Error("xray crashed after starting — check logs");
@@ -147,7 +394,6 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
             throw new Error(result.error || "Tunnel failed to start");
           }
         } else {
-          // Companion API not available
           let errorMsg = "Companion API not reachable";
           try {
             const errData = await companionResp.json();
@@ -156,7 +402,7 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           throw new Error(`Connection failed: ${errorMsg}`);
         }
 
-        // Create session record
+        // Best-effort session record
         try {
           await postJSON("/api/connect", {
             serverId: selectedConfig.id,
@@ -165,7 +411,9 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           });
         } catch {}
       } catch (e) {
-        toast.error("Connection failed", { description: (e as Error).message });
+        toast.error("Connection failed", {
+          description: (e as Error).message,
+        });
       } finally {
         setConnecting(false);
       }
@@ -187,17 +435,20 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
   const handleRefresh = async () => {
     toast.info("Refreshing configs…");
     try {
-      // Trigger subscription refresh
       const resp = await fetch("/api/subscriptions", { method: "GET" });
       if (resp.ok) {
         const data = await resp.json();
         const subs = data.subscriptions || [];
         for (const sub of subs) {
-          await fetch(`/api/subscriptions/${sub.id}/refresh`, { method: "POST" });
+          await fetch(`/api/subscriptions/${sub.id}/refresh`, {
+            method: "POST",
+          });
         }
       }
       refetchConfigs();
-      toast.success("Configs refreshed", { description: "Latest Iran configs loaded." });
+      toast.success("Configs refreshed", {
+        description: "Latest configs loaded.",
+      });
     } catch {
       toast.error("Refresh failed");
     }
@@ -207,23 +458,61 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
     toast.info("Checking for updates…");
     const r = await checkNow();
     if (r.ok) {
-      toast.success("Check complete", { description: updateStatus === "available" ? `Update v${updateVersion} available!` : "You're up to date." });
+      toast.success("Check complete", {
+        description:
+          updateStatus === "available"
+            ? `Update v${updateVersion} available!`
+            : "You're up to date.",
+      });
     } else {
       toast.error("Update check failed", { description: r.error });
     }
   };
 
+  // Testing progress text — "Testing 12" (how many probes are in-flight).
+  const testingCount = useMemo(
+    () => Object.values(latencies).filter((l) => l.testing).length,
+    [latencies]
+  );
+  const totalConfigs = configData?.configs?.length ?? 0;
+  const reachableCount = useMemo(
+    () => Object.values(latencies).filter((l) => l.ok && l.ms != null).length,
+    [latencies]
+  );
+
   return (
     <div className="space-y-6 pb-8">
-      {/* --- Header: version + update status --- */}
-      <div className="flex items-center justify-between">
+      {/* --- Header: Test all + version + refresh --- */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
           <h2 className="text-2xl font-bold text-white">Connect</h2>
           <p className="text-xs text-muted-foreground mt-1 font-tech uppercase tracking-wider">
             One tap to freedom
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Test all — probes all optimized configs in parallel server-side */}
+          <button
+            onClick={testAllConfigs}
+            disabled={testingAll || configsLoading || totalConfigs === 0}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#10d9a0]/40 transition-colors text-xs text-muted-foreground hover:text-white disabled:opacity-50 disabled:cursor-not-allowed"
+            title="Probe all configs in parallel and auto-select the fastest reachable one"
+          >
+            {testingAll ? (
+              <>
+                <RefreshCw className="w-3 h-3 animate-spin text-[#10d9a0]" />
+                <span className="text-[#10d9a0] font-tech">
+                  Testing{testingCount ? ` ${testingCount}` : "…"}
+                </span>
+              </>
+            ) : (
+              <>
+                <Activity className="w-3 h-3 text-[#10d9a0]" />
+                <span className="font-tech">Test all</span>
+              </>
+            )}
+          </button>
+
           {/* Version + update button */}
           <button
             onClick={handleCheckUpdate}
@@ -233,7 +522,9 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
             {updateStatus === "available" ? (
               <>
                 <Download className="w-3 h-3 text-[#10d9a0] animate-pulse" />
-                <span className="text-[#10d9a0] font-tech">v{updateVersion} ready</span>
+                <span className="text-[#10d9a0] font-tech">
+                  v{updateVersion} ready
+                </span>
               </>
             ) : updateStatus === "downloading" ? (
               <>
@@ -252,9 +543,11 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           <button
             onClick={handleRefresh}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.03] border border-white/5 hover:border-[#00f0ff]/30 transition-colors text-xs text-muted-foreground hover:text-white"
-            title="Refresh Iran configs"
+            title="Refresh configs"
           >
-            <RefreshCw className={`w-3 h-3 ${configsLoading ? "animate-spin" : ""}`} />
+            <RefreshCw
+              className={`w-3 h-3 ${configsLoading ? "animate-spin" : ""}`}
+            />
             <span className="font-tech">Refresh</span>
           </button>
         </div>
@@ -274,73 +567,134 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           }`}
           aria-label={isConnected ? "Disconnect VPN" : "Connect VPN"}
         >
-          {/* Pulse rings when connected */}
           {isConnected && (
             <>
               <div className="absolute inset-0 rounded-full border-2 border-[#10d9a0] animate-ping opacity-20" />
               <div className="absolute -inset-2 rounded-full border border-[#10d9a0]/30 animate-pulse" />
             </>
           )}
-
           <Power
-            className={`w-12 h-12 ${isConnected ? "text-[#02131a]" : "text-[#00f0ff]"}`}
+            className={`w-12 h-12 ${
+              isConnected ? "text-[#02131a]" : "text-[#00f0ff]"
+            }`}
             strokeWidth={2.2}
           />
-          <span className={`font-tech uppercase tracking-[0.3em] text-xs mt-2 ${
-            isConnected ? "text-[#02131a]" : isConnecting ? "text-[#02131a]" : "text-muted-foreground"
-          }`}>
-            {isConnected ? "Connected" : isConnecting ? "Connecting…" : "Tap to Connect"}
+          <span
+            className={`font-tech uppercase tracking-[0.3em] text-xs mt-2 ${
+              isConnected
+                ? "text-[#02131a]"
+                : isConnecting
+                ? "text-[#02131a]"
+                : "text-muted-foreground"
+            }`}
+          >
+            {isConnected
+              ? "Connected"
+              : isConnecting
+              ? "Connecting…"
+              : "Tap to Connect"}
           </span>
         </motion.button>
       </div>
 
-      {/* --- Selected server card --- */}
+      {/* --- Selected server card + Import button + Change button --- */}
       <div className="bg-card border border-white/5 rounded-xl p-4">
-        {selectedConfig ? (
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-[#00f0ff]/10 flex items-center justify-center">
+        <div className="flex items-center justify-between gap-2">
+          {selectedConfig ? (
+            <div className="flex items-center gap-3 min-w-0 flex-1">
+              <div className="w-10 h-10 rounded-lg bg-[#00f0ff]/10 flex items-center justify-center flex-shrink-0">
                 <span className="text-lg">🇮🇷</span>
               </div>
-              <div>
-                <div className="text-sm font-semibold text-white">
-                  {selectedConfig.protocol.toUpperCase()} · {selectedConfig.host}:{selectedConfig.port}
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-white flex items-center gap-2 flex-wrap">
+                  <span className="font-mono uppercase">
+                    {selectedConfig.protocol}
+                  </span>
+                  <span className="text-muted-foreground">·</span>
+                  <span className="truncate">
+                    {selectedConfig.host}:{selectedConfig.port}
+                  </span>
+                  {isPersonal(selectedConfig) && (
+                    <Star
+                      className="w-3.5 h-3.5 fill-[#ffb020] text-[#ffb020] flex-shrink-0"
+                      aria-label="Personal config"
+                    />
+                  )}
                 </div>
-                <div className="text-xs text-muted-foreground flex items-center gap-2 mt-0.5">
+                <div className="text-xs text-muted-foreground flex items-center gap-2 mt-0.5 flex-wrap">
                   {selectedConfig.flags && (
-                    <Badge variant="outline" className="text-[9px] py-0 px-1.5 border-[#8b5cf6]/30 text-[#8b5cf6]">
+                    <Badge
+                      variant="outline"
+                      className="text-[9px] py-0 px-1.5 border-[#8b5cf6]/30 text-[#8b5cf6]"
+                    >
                       {selectedConfig.flags.split(",")[0]}
                     </Badge>
                   )}
                   <span>Score: {selectedConfig.score}</span>
-                  {selectedConfig.reach === "ok" && (
-                    <span className="text-[#10d9a0]">✓ reachable</span>
-                  )}
+                  {(() => {
+                    const lat = latencies[selectedConfig.id];
+                    if (lat?.testing)
+                      return (
+                        <span className="text-muted-foreground">testing…</span>
+                      );
+                    if (lat?.ok && lat.ms != null)
+                      return (
+                        <span style={{ color: pingColor(lat.ms) }}>
+                          {lat.ms}ms
+                        </span>
+                      );
+                    if (lat?.ok === false)
+                      return (
+                        <span className="text-[#ff4d6d]">unreachable</span>
+                      );
+                    if (
+                      selectedConfig.reach === "ok" &&
+                      selectedConfig.latencyMs > 0
+                    )
+                      return (
+                        <span
+                          style={{ color: pingColor(selectedConfig.latencyMs) }}
+                        >
+                          {selectedConfig.latencyMs}ms
+                        </span>
+                      );
+                    return (
+                      <span className="text-muted-foreground/60">untested</span>
+                    );
+                  })()}
                 </div>
               </div>
             </div>
-            <button
-              onClick={() => setShowConfigList(!showConfigList)}
-              className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] text-xs text-muted-foreground hover:text-white transition-colors"
-            >
-              Change
-              <ChevronDown className={`w-3 h-3 transition-transform ${showConfigList ? "rotate-180" : ""}`} />
-            </button>
-          </div>
-        ) : (
-          <div className="flex items-center justify-between">
-            <div className="text-sm text-muted-foreground">
+          ) : (
+            <div className="text-sm text-muted-foreground flex-1">
               {configsLoading ? "Loading configs…" : "No config selected"}
             </div>
+          )}
+
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {/* + Import button — opens the ImportDialog modal */}
+            <button
+              onClick={() => setShowImport(true)}
+              className="flex items-center gap-1 px-3 py-2 rounded-lg bg-brand-gradient text-[#02131a] hover:opacity-90 text-xs font-tech uppercase tracking-wider transition-opacity shadow-[0_0_18px_rgba(0,240,255,0.25)]"
+              title="Import a personal config (paste a vmess/vless/trojan/ss URI)"
+              aria-label="Import personal config"
+            >
+              <Plus className="w-3.5 h-3.5" strokeWidth={2.5} />
+              <span className="hidden sm:inline">Import</span>
+            </button>
             <button
               onClick={() => setShowConfigList(!showConfigList)}
               className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white/[0.03] hover:bg-white/[0.06] text-xs text-muted-foreground hover:text-white transition-colors"
             >
-              Select config
-              <ChevronDown className={`w-3 h-3 transition-transform ${showConfigList ? "rotate-180" : ""}`} />
+              {selectedConfig ? "Change" : "Select"}
+              <ChevronDown
+                className={`w-3 h-3 transition-transform ${
+                  showConfigList ? "rotate-180" : ""
+                }`}
+              />
             </button>
           </div>
-        )}
+        </div>
 
         {/* Config dropdown */}
         <AnimatePresence>
@@ -351,44 +705,112 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
               exit={{ height: 0, opacity: 0 }}
               className="overflow-hidden"
             >
-              <div className="mt-3 pt-3 border-t border-white/5 space-y-1 max-h-64 overflow-y-auto">
-                {configData?.configs?.map((cfg) => (
-                  <button
-                    key={cfg.id}
-                    onClick={() => {
-                      setSelectedConfig(cfg);
-                      setShowConfigList(false);
-                    }}
-                    className={`w-full flex items-center justify-between p-3 rounded-lg transition-colors text-left ${
-                      selectedConfig?.id === cfg.id
-                        ? "bg-[#00f0ff]/10 border border-[#00f0ff]/20"
-                        : "hover:bg-white/[0.03] border border-transparent"
-                    }`}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className="text-xs font-mono text-[#5cf2ff] uppercase">{cfg.protocol}</div>
-                      <div>
-                        <div className="text-sm text-white">{cfg.host}:{cfg.port}</div>
-                        <div className="text-[10px] text-muted-foreground">
-                          {cfg.flags || "no flags"} · score {cfg.score}
+              <div className="mt-3 pt-3 border-t border-white/5 space-y-1">
+                {/* Status row */}
+                <div className="flex items-center justify-between px-1 pb-2 text-[10px] font-tech uppercase tracking-wider text-muted-foreground/70">
+                  <span>
+                    {totalConfigs} configs · {reachableCount} reachable
+                  </span>
+                  {testingAll && (
+                    <span className="text-[#10d9a0]">
+                      testing {testingCount}…
+                    </span>
+                  )}
+                </div>
+                <div className="max-h-80 overflow-y-auto pr-1 -mr-1 space-y-1 custom-scroll">
+                  {sortedConfigs.map((cfg) => {
+                    const lat = latencies[cfg.id];
+                    const personal = isPersonal(cfg);
+                    const isSelected = selectedConfig?.id === cfg.id;
+                    return (
+                      <button
+                        key={cfg.id}
+                        onClick={() => {
+                          setSelectedConfig(cfg);
+                          setUserSelectedId(cfg.id);
+                          setShowConfigList(false);
+                        }}
+                        className={`w-full flex items-center justify-between p-3 rounded-lg transition-colors text-left ${
+                          isSelected
+                            ? "bg-[#00f0ff]/10 border border-[#00f0ff]/20"
+                            : "hover:bg-white/[0.03] border border-transparent"
+                        }`}
+                      >
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          {/* Personal indicator: ⭐ for personal, hollow dot for default */}
+                          {personal ? (
+                            <Star
+                              className="w-4 h-4 fill-[#ffb020] text-[#ffb020] flex-shrink-0"
+                              aria-label="Personal config"
+                            />
+                          ) : (
+                            <div className="w-4 h-4 rounded-full border border-white/10 flex-shrink-0" />
+                          )}
+                          <div className="text-xs font-mono text-[#5cf2ff] uppercase flex-shrink-0">
+                            {cfg.protocol}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-sm text-white truncate">
+                              {cfg.label || `${cfg.host}:${cfg.port}`}
+                            </div>
+                            <div className="text-[10px] text-muted-foreground font-mono truncate">
+                              {cfg.host}:{cfg.port}
+                              {cfg.flags && (
+                                <span className="text-muted-foreground/60">
+                                  {" "}
+                                  ·{" "}
+                                  {cfg.flags
+                                    .split(",")
+                                    .slice(0, 2)
+                                    .join(",")}
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          {/* Latency badge */}
+                          <LatencyBadge
+                            state={lat}
+                            fallbackMs={cfg.latencyMs}
+                            fallbackReach={cfg.reach}
+                          />
+                          {isSelected && (
+                            <Check className="w-4 h-4 text-[#00f0ff]" />
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {sortedConfigs.length === 0 && (
+                    <div className="text-center text-sm text-muted-foreground py-6">
+                      No configs available.
+                      <div className="mt-3 flex items-center justify-center gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={handleRefresh}
+                          className="h-7 text-[10px]"
+                        >
+                          <RefreshCw
+                            className={`w-3 h-3 mr-1 ${
+                              configsLoading ? "animate-spin" : ""
+                            }`}
+                          />
+                          Refresh
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={() => setShowImport(true)}
+                          className="h-7 text-[10px] bg-brand-gradient text-[#02131a] hover:opacity-90"
+                        >
+                          <Plus className="w-3 h-3 mr-1" strokeWidth={2.5} />
+                          Import
+                        </Button>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      {cfg.reach === "ok" && (
-                        <span className="text-[10px] text-[#10d9a0]">✓</span>
-                      )}
-                      {selectedConfig?.id === cfg.id && (
-                        <Check className="w-4 h-4 text-[#00f0ff]" />
-                      )}
-                    </div>
-                  </button>
-                ))}
-                {configData?.configs?.length === 0 && (
-                  <div className="text-center text-sm text-muted-foreground py-4">
-                    No configs available. Click "Refresh" to fetch Iran configs.
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             </motion.div>
           )}
@@ -402,23 +824,58 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
           animate={{ opacity: 1, height: "auto" }}
           className="grid grid-cols-2 sm:grid-cols-4 gap-3"
         >
-          <MetricCard icon={<Download className="w-4 h-4" />} label="Download" value={formatRate(live.downBps)} color="#10d9a0" />
-          <MetricCard icon={<Upload className="w-4 h-4" />} label="Upload" value={formatRate(live.upBps)} color="#00f0ff" />
-          <MetricCard icon={<Activity className="w-4 h-4" />} label="Ping" value={`${live.ping}ms`} color="#ffb020" />
-          <MetricCard icon={<Clock className="w-4 h-4" />} label="Session" value={formatDuration(elapsed)} color="#8b5cf6" />
+          <MetricCard
+            icon={<Download className="w-4 h-4" />}
+            label="Download"
+            value={formatRate(live.downBps)}
+            color="#10d9a0"
+          />
+          <MetricCard
+            icon={<Upload className="w-4 h-4" />}
+            label="Upload"
+            value={formatRate(live.upBps)}
+            color="#00f0ff"
+          />
+          <MetricCard
+            icon={<Activity className="w-4 h-4" />}
+            label="Ping"
+            value={`${live.ping}ms`}
+            color="#ffb020"
+          />
+          <MetricCard
+            icon={<Clock className="w-4 h-4" />}
+            label="Session"
+            value={formatDuration(elapsed)}
+            color="#8b5cf6"
+          />
         </motion.div>
       )}
 
       {/* --- Quick toggles --- */}
       <div className="flex flex-wrap gap-2">
         {settings.killSwitch && (
-          <Badge variant="outline" className="border-[#ff4d6d]/30 text-[#ff4d6d] text-xs">Kill Switch</Badge>
+          <Badge
+            variant="outline"
+            className="border-[#ff4d6d]/30 text-[#ff4d6d] text-xs"
+          >
+            Kill Switch
+          </Badge>
         )}
         {settings.stealthMode && (
-          <Badge variant="outline" className="border-[#8b5cf6]/30 text-[#8b5cf6] text-xs">Stealth</Badge>
+          <Badge
+            variant="outline"
+            className="border-[#8b5cf6]/30 text-[#8b5cf6] text-xs"
+          >
+            Stealth
+          </Badge>
         )}
         {settings.blockTrackers && (
-          <Badge variant="outline" className="border-[#10d9a0]/30 text-[#10d9a0] text-xs">No Trackers</Badge>
+          <Badge
+            variant="outline"
+            className="border-[#10d9a0]/30 text-[#10d9a0] text-xs"
+          >
+            No Trackers
+          </Badge>
         )}
       </div>
 
@@ -430,21 +887,122 @@ export function ConnectView({ onPickServer }: { onPickServer: () => void }) {
         <div className="flex items-center gap-2 text-xs text-[#ffb020] bg-[#ffb020]/5 border border-[#ffb020]/10 rounded-lg p-3">
           <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span>
-            Desktop companion not detected. Real VPN tunneling requires the desktop app.
-            Connection will fail until the companion API is running.
+            Desktop companion not detected. Real VPN tunneling requires the
+            desktop app. Connection will fail until the companion API is
+            running.
           </span>
         </div>
       )}
+
+      {/* --- Import dialog (personal config paste) --- */}
+      <ImportDialog
+        open={showImport}
+        onOpenChange={setShowImport}
+        onDone={() => {
+          refetchConfigs();
+          toast.success("Personal config ready", {
+            description: "Now visible in your dropdown with a ⭐ badge.",
+          });
+        }}
+      />
     </div>
   );
 }
 
-function MetricCard({ icon, label, value, color }: { icon: React.ReactNode; label: string; value: string; color: string }) {
+// Latency badge — color-coded by latency with 5 visible states:
+//   - testing: gray spinner + "…"
+//   - reachable & ≤60ms: green badge with ms
+//   - reachable & 61-150ms: yellow badge with ms
+//   - reachable & >150ms: red badge with ms
+//   - unreachable: red "✗" badge
+//   - untested: gray "—" badge (or falls back to server-side reach value)
+function LatencyBadge({
+  state,
+  fallbackMs,
+  fallbackReach,
+}: {
+  state?: LatencyState;
+  fallbackMs: number;
+  fallbackReach: string;
+}) {
+  if (state?.testing) {
+    return (
+      <span className="inline-flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground">
+        <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+      </span>
+    );
+  }
+  if (state?.ok && state.ms != null) {
+    const color =
+      state.ms <= 60 ? "#10d9a0" : state.ms <= 150 ? "#ffb020" : "#ff4d6d";
+    const bg =
+      state.ms <= 60
+        ? "rgba(16,217,160,0.1)"
+        : state.ms <= 150
+        ? "rgba(255,176,32,0.1)"
+        : "rgba(255,77,109,0.1)";
+    const border =
+      state.ms <= 60
+        ? "rgba(16,217,160,0.3)"
+        : state.ms <= 150
+        ? "rgba(255,176,32,0.3)"
+        : "rgba(255,77,109,0.3)";
+    return (
+      <span
+        className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border"
+        style={{ color, background: bg, borderColor: border }}
+      >
+        {state.ms}ms
+      </span>
+    );
+  }
+  if (state?.ok === false) {
+    return (
+      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ff4d6d]/30 text-[#ff4d6d] bg-[#ff4d6d]/5">
+        ✗
+      </span>
+    );
+  }
+  // Untested — fall back to server-side reach if available
+  if (fallbackReach === "ok" && fallbackMs > 0) {
+    return (
+      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground">
+        {fallbackMs}ms
+      </span>
+    );
+  }
+  if (fallbackReach === "fail") {
+    return (
+      <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-[#ff4d6d]/30 text-[#ff4d6d] bg-[#ff4d6d]/5">
+        ✗
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center text-[10px] font-mono px-1.5 py-0.5 rounded border border-white/10 text-muted-foreground/60">
+      —
+    </span>
+  );
+}
+
+function MetricCard({
+  icon,
+  label,
+  value,
+  color,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  color: string;
+}) {
   return (
     <div className="bg-card border border-white/5 rounded-lg p-3">
       <div className="flex items-center gap-1.5 mb-1">
         <span style={{ color }}>{icon}</span>
-        <span className="text-[10px] font-tech uppercase tracking-wider text-muted-foreground">{label}</span>
+        <span className="text-[10px] font-tech uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
       </div>
       <div className="text-sm font-mono font-semibold text-white">{value}</div>
     </div>
