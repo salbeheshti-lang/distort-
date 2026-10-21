@@ -669,20 +669,48 @@ async function stopVpnEngine(): Promise<void> {
   currentVerifyAttempt++;
 
   if (vpnProcess) {
+    const proc = vpnProcess;
     try {
-      vpnProcess.kill("SIGTERM");
-      // Give it 500ms to exit gracefully
-      await new Promise((r) => setTimeout(r, 500));
-      if (!vpnProcess.killed) {
-        try { vpnProcess.kill("SIGKILL"); } catch {}
-        // FIX (VERIFY-TUNNEL-FIX): wait an additional 500ms after SIGKILL so
-        // xray's TCP listening sockets on 10808/10809 are fully released by
-        // the kernel. Without this delay, the next startVpnEngine() call may
-        // spawn xray before the OS has freed the ports — causing EADDRINUSE
-        // and a silent failure to bind the proxy inbound.
-        await new Promise((r) => setTimeout(r, 500));
-        log.info("xray ports released (10808/10809 free)");
+      // FIX (v1.0.38 audit — Q2): previously we relied on `vpnProcess.killed`
+      // which only tells us the SIGNAL was successfully delivered, NOT that
+      // the process actually exited. Now we race SIGTERM + a 1s wait against
+      // the actual 'exit' event. If 'exit' fires first, the process is really
+      // dead. If the timeout fires first, we SIGKILL and wait for 'exit' again.
+      const exited = await new Promise<boolean>((resolve) => {
+        const exitTimeout = setTimeout(() => resolve(false), 1000);
+        proc.once("exit", () => {
+          clearTimeout(exitTimeout);
+          resolve(true);
+        });
+        try { proc.kill("SIGTERM"); } catch (e: any) {
+          log.warn(`stopVpnEngine: SIGTERM failed (${e?.message}) — trying SIGKILL directly`);
+          clearTimeout(exitTimeout);
+          try { proc.kill("SIGKILL"); } catch {}
+          resolve(false); // we don't know if SIGKILL worked — wait for exit below
+        }
+      });
+
+      if (!exited) {
+        // SIGTERM didn't cause exit within 1s → SIGKILL
+        try { proc.kill("SIGKILL"); } catch {}
+        // FIX: wait for the ACTUAL 'exit' event (up to 2s), not just a fixed
+        // delay. This guarantees the process is dead before we release the slot.
+        await new Promise<void>((resolve) => {
+          const killTimeout = setTimeout(() => {
+            log.warn("stopVpnEngine: xray did not exit within 2s of SIGKILL — giving up");
+            resolve();
+          }, 2000);
+          proc.once("exit", () => {
+            clearTimeout(killTimeout);
+            resolve();
+          });
+        });
       }
+
+      // Additional 300ms for the OS to free TCP listening sockets on 10808/10809.
+      // (Even after exit, the kernel may briefly hold the ports in TIME_WAIT.)
+      await new Promise((r) => setTimeout(r, 300));
+      log.info("xray process stopped; ports 10808/10809 released");
     } catch (e) {
       log.error("Error killing xray:", e);
     }
@@ -1792,13 +1820,16 @@ function scrubConfigUri(s: string): string {
 // companion API's /api/tunnel/start endpoint. Shares the global vpnProcess
 // variable with the desktop UI flow so the two can't double-spawn xray.
 async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; error?: string }> {
-  // Stop any existing xray process first (whether started by the API or by
-  // the desktop UI's startVpnEngine() — there is only one xray process slot).
-  if (vpnProcess) {
-    try { vpnProcess.kill("SIGTERM"); } catch {}
-    vpnProcess = null;
-  }
-  stopHealthMonitoring();
+  // FIX (v1.0.38 audit — Q11): previously this function did its OWN
+  // kill+null on vpnProcess without going through stopVpnEngine, which meant:
+  //   - No `currentVerifyAttempt++` → stale guard couldn't detect this path
+  //   - No wait for the process to actually die → EADDRINUSE risk
+  //   - No port-release delay
+  // Now we delegate to stopVpnEngine() which does all of the above. This also
+  // means the companion API path and the desktop UI path share the SAME
+  // stale-guard counter, so a verification callback from either path can be
+  // invalidated by a stop or a new start from the other path.
+  await stopVpnEngine();
 
   // Build the REAL config (uses real credentials from configUri, or throws)
   let config: object;
@@ -1887,6 +1918,12 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    // FIX (v1.0.38 audit — Q11): capture PID + attemptId so stderr/exit
+    // handlers from THIS spawn can be detected as stale if a new spawn
+    // (from either the companion API or the desktop UI) supersedes them.
+    const companionXrayPid = vpnProcess.pid;
+    currentVerifyAttempt++;
+    const companionAttemptId = currentVerifyAttempt;
 
     vpnProcess.stdout?.on("data", (data) => {
       log.info(`[xray] ${data.toString().trim()}`);
@@ -1894,6 +1931,11 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     vpnProcess.stderr?.on("data", (data) => {
       const line = data.toString().trim();
       log.error(`[xray] ${line}`);
+      // STALE GUARD: drop stderr from a superseded process.
+      if (companionAttemptId !== currentVerifyAttempt) {
+        log.info(`[companion-api] stale stderr from attempt ${companionAttemptId} — dropping: ${line.slice(0, 80)}`);
+        return;
+      }
       // Append to buffer (keep last 4KB)
       stderrBuffer += line + "\n";
       if (stderrBuffer.length > MAX_STDERR_BUFFER) {
@@ -1902,7 +1944,15 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     });
     vpnProcess.on("exit", (code) => {
       log.info(`[companion-api] xray exited with code ${code}`);
-      vpnProcess = null;
+      // STALE GUARD: don't let a stale exit overwrite a newer connection state.
+      if (companionAttemptId !== currentVerifyAttempt) {
+        log.info(`[companion-api] stale exit from attempt ${companionAttemptId} — dropping`);
+        return;
+      }
+      // Only null vpnProcess if THIS is still the active process.
+      if (vpnProcess && vpnProcess.pid === companionXrayPid) {
+        vpnProcess = null;
+      }
       // If the desktop UI thought it was connected, mark it disconnected now.
       const vpn = store.get("vpn");
       if (vpn.connected) {
