@@ -94,8 +94,12 @@ function createControllableProber() {
  * triggers a microtask that checks if both ports have been probed.
  */
 function createBlockingProber() {
-  const resolvers = new Map<number, (result: boolean) => void>();
+  // resolvers stores BOTH resolve and reject handlers for each port.
+  // Type: { resolve: (result: boolean) => void; reject: (err: any) => void }
+  // This allows resolveProbe to resolve, and rejectProbe to reject.
+  const resolvers = new Map<number, { resolve: (result: boolean) => void; reject: (err: any) => void }>();
   const results = new Map<number, boolean>();
+  const rejectErrors = new Map<number, Error>();
   const probeCalledCallbacks = new Map<number, (() => void)[]>();
   const probeSettledCallbacks = new Map<number, (() => void)[]>();
   const probeResults = new Map<number, boolean>();
@@ -129,20 +133,21 @@ function createBlockingProber() {
         for (const cb of called) Promise.resolve().then(() => cb());
       }
       return new Promise<boolean>((resolve, reject) => {
-        const onResolve = (result: boolean) => {
-          probeResults.set(port, result);
-          // Notify settled listeners
-          Promise.resolve().then(() => notifySettled(port));
-          resolve(result);
+        const handlers = {
+          resolve: (result: boolean) => {
+            probeResults.set(port, result);
+            Promise.resolve().then(() => notifySettled(port));
+            resolve(result);
+          },
+          reject: (err: any) => {
+            // Even on rejection, track that this port was probed so
+            // onProbeChainComplete doesn't hang forever.
+            probeResults.set(port, false);
+            Promise.resolve().then(() => notifySettled(port));
+            reject(err);
+          },
         };
-        const onReject = (err: any) => {
-          // Even on rejection, track that this port was probed so
-          // onProbeChainComplete doesn't hang forever.
-          probeResults.set(port, false);
-          Promise.resolve().then(() => notifySettled(port));
-          reject(err);
-        };
-        resolvers.set(port, onResolve);
+        resolvers.set(port, handlers);
         // If a result was pre-set, resolve immediately.
         if (results.has(port)) {
           const r = results.get(port)!;
@@ -151,20 +156,41 @@ function createBlockingProber() {
           Promise.resolve().then(() => notifySettled(port));
           resolve(r);
         }
+        // If a rejection was pre-set, reject immediately.
+        if (rejectErrors.has(port)) {
+          const err = rejectErrors.get(port)!;
+          probeResults.set(port, false);
+          resolvers.delete(port);
+          Promise.resolve().then(() => notifySettled(port));
+          reject(err);
+        }
       });
     },
     /** Pre-set a result + resolve any pending probe for that port. */
     resolveProbe: (port: number, isFree: boolean) => {
       results.set(port, isFree);
-      const resolver = resolvers.get(port);
-      if (resolver) {
-        resolver(isFree);
+      const h = resolvers.get(port);
+      if (h) {
         resolvers.delete(port);
+        h.resolve(isFree);
+      }
+    },
+    /** Pre-set a rejection + reject any pending probe for that port. */
+    rejectProbe: (port: number, error: Error) => {
+      rejectErrors.set(port, error);
+      const h = resolvers.get(port);
+      if (h) {
+        resolvers.delete(port);
+        h.reject(error);
       }
     },
     /** Pre-set a result (probe will resolve immediately when called). */
     presetResult: (port: number, isFree: boolean) => {
       results.set(port, isFree);
+    },
+    /** Pre-set a rejection (probe will reject immediately when called). */
+    presetReject: (port: number, error: Error) => {
+      rejectErrors.set(port, error);
     },
     /**
      * Resolves when the prober is ENTERED for the given port.
@@ -212,6 +238,8 @@ function createBlockingProber() {
       probeCount = 0;
       chainCompleteResolve = null;
       chainCompletePromise = null;
+      rejectErrors.clear();
+      results.clear();
     },
     getProbeCount: () => probeCount,
   };
@@ -772,5 +800,180 @@ describe("createBlockingProber — helper robustness tests", () => {
     expect(r1).toBe(false);
     expect(r2).toBe(true);
     expect(prober.getProbeCount()).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests for rejection handling (v10 audit fix).
+// Verifies that onProbeChainComplete does NOT hang when a probe rejects,
+// and that rejection is not silently treated as success.
+// ---------------------------------------------------------------------------
+
+describe("createBlockingProber — rejection handling", () => {
+  test("onProbeChainComplete resolves after probe rejection (no hang)", async () => {
+    const prober = createBlockingProber();
+    prober.presetReject(10808, new Error("ECONNREFUSED"));
+    prober.presetResult(10809, true);
+
+    // Both probes run: SOCKS rejects, HTTP resolves.
+    const p1 = prober.prober(10808, 1, 10);
+    const p2 = prober.prober(10809, 1, 10);
+
+    // SOCKS should reject.
+    await expect(p1).rejects.toThrow("ECONNREFUSED");
+    // HTTP should resolve.
+    await expect(p2).resolves.toBe(true);
+
+    // onProbeChainComplete must NOT hang — it should resolve because
+    // both probes have settled (one resolved, one rejected).
+    const chain = prober.onProbeChainComplete();
+    // Use a 500ms timeout as a safety net — NOT for assertion timing.
+    // The chain should resolve on the next microtask after both probes settle.
+    const result = await Promise.race([
+      chain.then(() => "resolved"),
+      new Promise<string>((r) => setTimeout(() => r("hang"), 500)),
+    ]);
+    expect(result).toBe("resolved");
+  });
+
+  test("rejected probe does not count as success (probeResults records false)", async () => {
+    const prober = createBlockingProber();
+    prober.presetReject(10808, new Error("EPERM"));
+
+    const p = prober.prober(10808, 1, 10);
+    await expect(p).rejects.toThrow("EPERM");
+
+    // After rejection, onProbeSettled should resolve (not hang).
+    const settled = prober.onProbeSettled(10808);
+    const result = await Promise.race([
+      settled.then(() => "settled"),
+      new Promise<string>((r) => setTimeout(() => r("hang"), 500)),
+    ]);
+    expect(result).toBe("settled");
+  });
+
+  test("both probes reject → onProbeChainComplete still resolves", async () => {
+    const prober = createBlockingProber();
+    prober.presetReject(10808, new Error("ECONNREFUSED"));
+    prober.presetReject(10809, new Error("EACCES"));
+
+    const p1 = prober.prober(10808, 1, 10);
+    const p2 = prober.prober(10809, 1, 10);
+
+    await expect(p1).rejects.toThrow("ECONNREFUSED");
+    await expect(p2).rejects.toThrow("EACCES");
+
+    const chain = prober.onProbeChainComplete();
+    const result = await Promise.race([
+      chain.then(() => "resolved"),
+      new Promise<string>((r) => setTimeout(() => r("hang"), 500)),
+    ]);
+    expect(result).toBe("resolved");
+  });
+
+  test("rejectProbe() on a pending probe triggers rejection", async () => {
+    const prober = createBlockingProber();
+    // Don't preset — create a pending probe, then reject it.
+    const p = prober.prober(10808, 1, 10);
+    prober.rejectProbe(10808, new Error("test rejection"));
+
+    await expect(p).rejects.toThrow("test rejection");
+  });
+
+  test("stopXrayProcess with rejecting prober — stuck path catches rejection (onStuckCleared NOT called)", async () => {
+    // In the stuck path, stopXrayProcess chains:
+    //   doPortProbe(socks).then(socksFree => doPortProbe(http).then(...))
+    //   .catch(e => log error, don't call onStuckCleared)
+    // If SOCKS probe rejects, the .catch fires. The HTTP probe is NEVER
+    // called (the .then is skipped). So probeResults.size stays at 1.
+    //
+    // onProbeChainComplete would hang waiting for size >= 2. To handle
+    // this, we DON'T use onProbeChainComplete here — we use onProbeSettled
+    // for just the SOCKS port (the one that rejects). The .catch in
+    // stopXrayProcess fires synchronously after SOCKS rejects, so we just
+    // need to wait for SOCKS to settle.
+    const prober = createBlockingProber();
+    prober.presetReject(10808, new Error("simulated ECONNREFUSED"));
+    prober.presetResult(10809, true);
+
+    const mock = new MockChildProcess();
+    const latch = createCallbackLatch();
+
+    const stopPromise = stopXrayProcess(mock as unknown as ChildProcess, {
+      sigtermTimeoutMs: 50,
+      sigkillTimeoutMs: 50,
+      portProbeAttempts: 1,
+      portProbeIntervalMs: 10,
+      socksPort: 10808,
+      httpPort: 10809,
+      portProber: prober.prober,
+      onStuckCleared: latch.callback,
+    });
+
+    const result = await stopPromise;
+    expect(result.stuck).toBe(true);
+
+    // Wait for SOCKS probe to settle (reject). After rejection, the
+    // .catch() in stopXrayProcess fires and the chain is done.
+    const socksSettled = prober.onProbeSettled(10808);
+
+    // Emit exit — triggers the re-probe chain.
+    mock.emitExit(0);
+
+    // Wait for SOCKS to settle (it rejects, but onProbeSettled still fires
+    // because the reject handler calls notifySettled).
+    await socksSettled;
+
+    // Give one microtask for the .catch() handler to run.
+    await new Promise(r => setTimeout(r, 0));
+
+    // onStuckCleared must NOT have been called — the .catch() in
+    // stopXrayProcess catches the rejection and refuses to clear.
+    expect(latch.getCount()).toBe(0);
+
+    // Also verify only 1 probe ran (HTTP probe was never called because
+    // SOCKS rejected and .then() was skipped).
+    expect(prober.getProbeCount()).toBe(1);
+  });
+
+  test("no unhandled rejection from stopXrayProcess when probe rejects", async () => {
+    // This test verifies that stopXrayProcess's .catch() handler swallows
+    // the rejection cleanly. If it didn't, Node would emit an
+    // 'unhandledRejection' event.
+    const prober = createBlockingProber();
+    prober.presetReject(10808, new Error("test unhandled"));
+
+    let unhandledRejection = false;
+    const handler = () => { unhandledRejection = true; };
+    process.on("unhandledRejection", handler);
+
+    try {
+      const mock = new MockChildProcess();
+
+      const stopPromise = stopXrayProcess(mock as unknown as ChildProcess, {
+        sigtermTimeoutMs: 50,
+        sigkillTimeoutMs: 50,
+        portProbeAttempts: 1,
+        portProbeIntervalMs: 10,
+        socksPort: 10808,
+        httpPort: 10809,
+        portProber: prober.prober,
+      });
+
+      const result = await stopPromise;
+      // Emit exit to trigger the re-probe chain.
+      mock.emitExit(0);
+
+      // Wait for SOCKS probe to settle (rejects).
+      const socksSettled = prober.onProbeSettled(10808);
+      await socksSettled;
+
+      // Let any potential unhandledRejection event propagate.
+      await new Promise(r => setTimeout(r, 50));
+
+      expect(unhandledRejection).toBe(false);
+    } finally {
+      process.off("unhandledRejection", handler);
+    }
   });
 });
