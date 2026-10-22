@@ -69,3 +69,6 @@ public/DISTORT-*.zip
 *.dmg
 *.AppImage
 tool-results/
+
+# Runtime state — should not be committed
+.zscripts/dev.pid
