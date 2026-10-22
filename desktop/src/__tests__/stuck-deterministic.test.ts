@@ -922,10 +922,11 @@ describe("createBlockingProber — rejection handling", () => {
 
     // Wait for SOCKS to settle (it rejects, but onProbeSettled still fires
     // because the reject handler calls notifySettled).
+    // The .catch() in stopXrayProcess runs BEFORE notifySettled (it's
+    // registered earlier in the Promise chain), so by the time
+    // socksSettled resolves, .catch has ALREADY executed.
+    // No setTimeout needed.
     await socksSettled;
-
-    // Give one microtask for the .catch() handler to run.
-    await new Promise(r => setTimeout(r, 0));
 
     // onStuckCleared must NOT have been called — the .catch() in
     // stopXrayProcess catches the rejection and refuses to clear.
@@ -968,8 +969,10 @@ describe("createBlockingProber — rejection handling", () => {
       const socksSettled = prober.onProbeSettled(10808);
       await socksSettled;
 
-      // Let any potential unhandledRejection event propagate.
-      await new Promise(r => setTimeout(r, 50));
+      // unhandledRejection is emitted on the next macrotask tick (not
+      // microtask). One setTimeout(0) is the minimum needed to let
+      // Node's event loop check for unhandled rejections.
+      await new Promise(r => setTimeout(r, 0));
 
       expect(unhandledRejection).toBe(false);
     } finally {
