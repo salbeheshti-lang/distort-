@@ -116,3 +116,11 @@ jobs:
         working-directory: desktop
         run: bun test src/__tests__/production-verify-tunnel.test.ts
 
+      - name: Run desktop stuck-deterministic tests
+        working-directory: desktop
+        run: bun test src/__tests__/stuck-deterministic.test.ts
+
+      - name: Run desktop xray-process-manager tests
+        working-directory: desktop
+        run: bun test src/__tests__/xray-process-manager.test.ts
+
