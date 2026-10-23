@@ -124,3 +124,15 @@ jobs:
         working-directory: desktop
         run: bun test src/__tests__/xray-process-manager.test.ts
 
+      # Regression tests for port-bind failure + deadlock fixes (PR #4).
+      # Verifies:
+      #   - checkPortInUse 3-state detection (free/in-use/unknown)
+      #   - checkXrayPortsInUse both-ports check
+      #   - stopXrayProcess already-exited detection
+      #   - port release after stop (failover prerequisite)
+      #   - concurrent startVpnEngine mutex
+      #   - INTEGRATION: 6 failover scenarios with real child processes
+      #   - Deadlock regression: stale verify + stale exit paths
+      - name: Run desktop xray-port-bind-failure tests
+        working-directory: desktop
+        run: bun test src/__tests__/xray-port-bind-failure.test.ts
