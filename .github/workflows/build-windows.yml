@@ -44,6 +44,30 @@ jobs:
           if [ ! -f xray.exe ]; then echo "ERROR: xray.exe missing"; exit 1; fi
           echo "xray version: ${XRAY_VERSION}"
           ls -la wintun.dll xray.exe
+      - name: Verify Next.js standalone build output (packaging validation)
+        working-directory: desktop
+        shell: bash
+        run: |
+          # This step prevents shipping a broken Windows build where the
+          # dashboard's Next.js standalone server.js is missing.
+          STANDALONE="../.next/standalone"
+          echo "Checking standalone output at: $STANDALONE"
+          if [ ! -f "$STANDALONE/server.js" ]; then
+            echo "ERROR: $STANDALONE/server.js is missing."
+            echo "  The Next.js standalone build did not produce server.js."
+            exit 1
+          fi
+          if [ ! -d "$STANDALONE/.next/static" ]; then
+            echo "ERROR: $STANDALONE/.next/static is missing."
+            exit 1
+          fi
+          if [ ! -d "$STANDALONE/public" ]; then
+            echo "ERROR: $STANDALONE/public is missing."
+            exit 1
+          fi
+          echo "✓ standalone/server.js present ($(wc -c < "$STANDALONE/server.js") bytes)"
+          echo "✓ standalone/.next/static present ($(find "$STANDALONE/.next/static" -type f | wc -l) files)"
+          echo "✓ standalone/public present ($(find "$STANDALONE/public" -type f | wc -l) files)"
       - name: Build desktop app (NSIS installer + portable)
         working-directory: desktop
         run: |

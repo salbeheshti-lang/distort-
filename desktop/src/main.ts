@@ -387,7 +387,7 @@ function buildXrayConfig(server: VpnState["server"], protocol: string, configUri
 
 import { randomUUID as cryptoRandomUUID } from "crypto";
 import { parseConfigUri } from "./config-parser";
-import { stopXrayProcess } from "./xray-process-manager";
+import { stopXrayProcess, checkXrayPortsInUse } from "./xray-process-manager";
 import {
   verifyTunnelTraffic,
   fetchRealIp,
@@ -467,6 +467,45 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       throw new Error("Previous xray process is stuck and refuses to exit. Please restart the app.");
     }
 
+    // PRE-BIND PORT CHECK (fail-fast for the "bind: Only one usage of each
+    // socket address" error observed on Windows).
+    //
+    // Without this check, xray spawns, tries to bind, fails, and exits with
+    // code -1 (4294967295). The exit fires within ~100ms, but the caller
+    // (tryQuickConnectTier) doesn't know about it — it waits the full 20s
+    // verification timeout before moving to the next config.
+    //
+    // With this check, we detect the port conflict BEFORE spawning and throw
+    // immediately with a clear error. The caller's catch block handles the
+    // failover.
+    //
+    // SAFE: we never terminate the occupying process. We only probe + log.
+    // The caller (tryQuickConnectTier) will call stopVpnEngine() on the next
+    // loop iteration, which handles cleanup properly.
+    const portCheck = await checkXrayPortsInUse(10808, 10809);
+    if (portCheck.anyInUse) {
+      const which: string[] = [];
+      if (portCheck.socksInUse) which.push(`10808 (SOCKS5)`);
+      if (portCheck.httpInUse) which.push(`10809 (HTTP proxy)`);
+      if (portCheck.anyUnknown) {
+        which.push(`port(s) with indeterminate state (socks=${portCheck.socksState}/${portCheck.socksErrorCode ?? "ok"}, http=${portCheck.httpState}/${portCheck.httpErrorCode ?? "ok"})`);
+      }
+      log.error(
+        `startVpnEngine: ABORTING spawn — port(s) not confirmed free: ${which.join(", ")}. ` +
+        `vpnProcess is ${vpnProcess ? `PID=${vpnProcess.pid}` : "null"}. ` +
+        `Possible cause: previous xray did not release ports, another process is bound, ` +
+        `or a network/firewall issue prevented port probing.`
+      );
+      // Do NOT set xrayStuck here — that would permanently block failover.
+      // Instead, throw so the caller (tryQuickConnectTier) can call
+      // stopVpnEngine() and retry. If stopVpnEngine can't clear the port,
+      // IT will set xrayStuck (which is the correct place).
+      throw new Error(
+        `Cannot start xray: port(s) not confirmed free: ${which.join(", ")}. ` +
+        `Previous xray process may not have released ports, or a network issue prevented probing.`
+      );
+    }
+
     // Build the REAL config (uses real credentials from configUri, or throws)
     const config = buildXrayConfig(server, protocol, configUri);
     const configPath = path.join(app.getPath("userData"), "xray-config.json");
@@ -477,6 +516,15 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     if (!fs.existsSync(xrayPath)) {
       log.error(`xray binary not found at: ${xrayPath}`);
       throw new Error("VPN engine binary missing");
+    }
+    // DIAGNOSTIC: log binary path + size so we can verify it's not
+    // corrupted/zero-byte/antivirus-modified when investigating crashes.
+    try {
+      const xrayStat = fs.statSync(xrayPath);
+      log.info(`[startVpnEngine] xray binary: path=${xrayPath}, size=${xrayStat.size} bytes, modified=${xrayStat.mtime.toISOString()}`);
+    } catch (e: any) {
+      log.error(`[startVpnEngine] xray binary stat failed: ${e?.message}`);
+      throw new Error(`VPN engine binary inaccessible: ${e?.message}`);
     }
 
     // Spawn xray.exe
@@ -500,25 +548,56 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   currentVerifyAttempt++;
   const attemptId = currentVerifyAttempt;
 
+    // DIAGNOSTIC: spawn error handler — catches EACCES, EPERM, ENOENT,
+    // or any other error that prevents the process from starting.
+    // Without this, a spawn error is uncaught and the startupOutcome
+    // promise hangs forever (deadlock).
+    // NOTE: This handler is registered AFTER attemptId is assigned so
+    // the stale guard works correctly.
+    vpnProcess.on("error", (err: any) => {
+      const code = err?.code || "unknown";
+      log.error(`[startVpnEngine] xray SPAWN ERROR: ${err?.message || err} (code: ${code})`);
+      // STALE GUARD: only resolve if this is still the current attempt.
+      if (attemptId === currentVerifyAttempt) {
+        resolveStartupOutcome(false);
+      }
+    });
+
   // Track xray's health — only mark "connected" after REAL HTTP request through proxy
   let handshakeConfirmed = false;
   let startupError = "";
+  // STARTUP OUTCOME PROMISE — resolves true on success, false on failure.
+  // startVpnEngine awaits this so the caller (tryQuickConnectTier) knows
+  // immediately whether the tunnel came up, instead of waiting a blind 20s.
+  let resolveStartupOutcome!: (success: boolean) => void;
+  const startupOutcome = new Promise<boolean>((resolve) => { resolveStartupOutcome = resolve; });
   log.info("[startVpnEngine] waiting 5s before verification...");
   const startupTimeout = setTimeout(() => {
     // Bail out if this attempt has been superseded by a newer startVpnEngine call.
     if (attemptId !== currentVerifyAttempt) {
       log.info(`[startVpnEngine] attempt ${attemptId} superseded — skipping stale verification`);
+      // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+      // Without this, `await startupOutcome` below would hang forever when
+      // the caller (stopVpnEngine or a new startVpnEngine) supersedes this attempt.
+      resolveStartupOutcome(false);
       return;
     }
     // Bail out if xray already exited or was marked errored.
     if (handshakeConfirmed || startupError) {
       log.info(`[startVpnEngine] attempt ${attemptId} already resolved (confirmed=${handshakeConfirmed}, error=${!!startupError}) — skipping verification`);
+      // startupOutcome was already resolved by the exit/stderr handler that
+      // set handshakeConfirmed or startupError — no need to resolve again.
+      // (Calling resolve twice is a no-op, but we avoid it for clarity.)
       return;
     }
     // Bail out if the vpnProcess we started is no longer the active one
     // (e.g. stopVpnEngine was called, or a new startVpnEngine replaced it).
     if (!vpnProcess || vpnProcess.pid !== xrayPid) {
       log.info(`[startVpnEngine] attempt ${attemptId} xray process no longer active — skipping verification`);
+      // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+      // stopVpnEngine may have killed xray while we were waiting the 5s.
+      // Without this, `await startupOutcome` would hang forever.
+      resolveStartupOutcome(false);
       return;
     }
     // xray is still alive after 5s — do a REAL HTTP request through the
@@ -529,6 +608,11 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       // STALE GUARD: if this attempt is no longer current, drop the result.
       if (attemptId !== currentVerifyAttempt) {
         log.info(`[startVpnEngine] attempt ${attemptId} verification result received but superseded — dropping`);
+        // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+        // Without this, `await startupOutcome` would hang forever if the
+        // verification completed AFTER the attempt was superseded (e.g.,
+        // stopVpnEngine was called during the 10s verify window).
+        resolveStartupOutcome(false);
         return;
       }
       if (verified && !handshakeConfirmed && !startupError) {
@@ -544,6 +628,8 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
         log.info("xray-core confirmed working (HTTP through proxy succeeded) — connected");
         // Start tunnel health monitoring — checks every 30s if tunnel is alive
         startHealthMonitoring();
+        // Signal startup success to the awaiting caller.
+        resolveStartupOutcome(true);
       } else if (!startupError) {
         log.warn("xray process alive but HTTP verification failed — NOT marking as connected");
         store.set("vpn", {
@@ -555,11 +641,18 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
         });
         mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
         mainWindow?.webContents.send("vpn:error", "Tunnel started but HTTP request through proxy failed. The server may be unreachable or credentials may be invalid.");
+        // Signal startup FAILURE to the awaiting caller — fail fast.
+        resolveStartupOutcome(false);
       }
     }).catch((e: any) => {
       // Defensive: verifyHttpThroughProxy should never throw (it catches internally)
       // but if it does, we MUST not leave the state in limbo.
-      if (attemptId !== currentVerifyAttempt) return;
+      if (attemptId !== currentVerifyAttempt) {
+        // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+        // Same reasoning as the stale path above.
+        resolveStartupOutcome(false);
+        return;
+      }
       log.error(`[startVpnEngine] verifyHttpThroughProxy threw unexpectedly: ${e?.message}`);
       store.set("vpn", {
         connected: false,
@@ -570,6 +663,8 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       });
       mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
       mainWindow?.webContents.send("vpn:error", `Verification error: ${e?.message || "unknown"}`);
+      // Signal startup FAILURE to the awaiting caller — fail fast.
+      resolveStartupOutcome(false);
     });
   }, 5000);
 
@@ -644,16 +739,27 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       });
       mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
       mainWindow?.webContents.send("vpn:error", startupError);
+      // Signal startup FAILURE to the awaiting caller — fail fast.
+      // This is the path that catches "bind: Only one usage of each socket
+      // address" errors and prevents the caller from waiting 20s.
+      resolveStartupOutcome(false);
     }
   });
 
-  vpnProcess.on("exit", (code) => {
-    log.info(`xray exited with code ${code}`);
+  vpnProcess.on("exit", (code, signal) => {
+    // DIAGNOSTIC: log BOTH code and signal so we can distinguish:
+    //   - code=0: clean exit (normal shutdown)
+    //   - code=1: xray error (config invalid, missing DLL, etc.)
+    //   - code=-1 / 4294967295: xray crashed (bind failure, missing dependency)
+    //   - code=null, signal!=null: killed by signal (SIGTERM/SIGKILL)
+    log.info(`[startVpnEngine] xray exited: code=${code}, signal=${signal}`);
     clearTimeout(startupTimeout);
     // STALE GUARD: if this exit is from a previous attempt's xray process,
     // don't let it overwrite the current vpn state.
     if (attemptId !== currentVerifyAttempt) {
-      log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code ${code}) — dropping`);
+      log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code=${code}, signal=${signal}) — dropping`);
+      // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+      resolveStartupOutcome(false);
       return;
     }
     if (store.get("vpn.connected")) {
@@ -664,6 +770,19 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
         log.warn("Kill switch activated — xray exited unexpectedly");
         mainWindow?.webContents.send("vpn:kill-switch-activated");
       }
+      // Note: startupOutcome was already resolved (true) by the verification
+      // success path that set vpn.connected = true. No need to resolve
+      // again — the await has already completed.
+    } else if (!handshakeConfirmed && !startupError) {
+      // xray exited BEFORE handshake completed and without a captured stderr
+      // error. This is the "bind failure" path: xray spawns, fails to bind,
+      // exits with code -1 (4294967295 on Windows) within ~100ms, and the
+      // stderr "failed to listen" line may or may not have been captured
+      // yet (stderr is async).
+      //
+      // Signal startup FAILURE to the awaiting caller — fail fast.
+      log.error(`[startVpnEngine] xray exited with code ${code} before handshake completed — treating as startup failure`);
+      resolveStartupOutcome(false);
     }
   });
 
@@ -682,6 +801,33 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     mainWindow?.webContents.send("vpn:state-changed", store.get("vpn"));
     log.info("xray-core starting — waiting for handshake");
   }
+
+  // AWAIT STARTUP OUTCOME — this is the critical fail-fast fix.
+  // Instead of returning immediately and letting the caller (tryQuickConnectTier)
+  // wait a blind 20s timeout, we wait for the startup outcome:
+  //   - On success (verification confirmed) → resolveStartupOutcome(true) → we return normally
+  //   - On failure (early exit, bind error, verification failed) → resolveStartupOutcome(false) → we THROW
+  //
+  // This means:
+  //   - Bind failure (xray exits in ~100ms) → caller knows in <1s, not 20s
+  //   - Verification failure → caller knows in ~15s (5s wait + 10s verify), not 20s
+  //   - Success → caller knows in ~15s, same as before (no regression)
+  log.info("[startVpnEngine] awaiting startup outcome (success or fail-fast)...");
+  const success = await startupOutcome;
+  if (!success) {
+    const reason = startupError || `xray process exited before tunnel was verified`;
+    log.error(`[startVpnEngine] startup FAILED: ${reason}`);
+    // Clean up the failed xray process before throwing.
+    // stopVpnEngine is safe to call even if xray already exited — it will
+    // detect the exit and just probe ports.
+    try {
+      await stopVpnEngine();
+    } catch (e: any) {
+      log.warn(`[startVpnEngine] cleanup after startup failure threw: ${e?.message}`);
+    }
+    throw new Error(`xray startup failed: ${reason}`);
+  }
+  log.info("[startVpnEngine] startup SUCCEEDED — tunnel verified");
   } finally {
     // FIX (v1.0.38 audit v3 — BUG 5): clear the mutex on ALL exit paths
     // (success, thrown error, or returned early). Exceptions propagate
@@ -1733,49 +1879,37 @@ async function tryQuickConnectTier(
 
     try {
       await disableKillSwitch();
+      // startVpnEngine now AWAITS the startup outcome and THROWS on failure
+      // (bind error, early exit, verification failure). This means:
+      //   - On success: returns normally after verification (~15s)
+      //   - On failure: throws immediately (<1s for bind error, ~15s for verify fail)
+      // No more blind 20s wait — the caller knows the result as soon as
+      // startVpnEngine returns or throws.
       await startVpnEngine(server, cfg.protocol, cfg.uri);
 
-      // startVpnEngine performs pre-flight validation; wait for the state
-      // machine to verify the tunnel before considering this config successful.
-      //
-      // FIX (VERIFY-TUNNEL-FIX): bumped from 7s to 20s. The previous 7s wait
-      // was too short — startVpnEngine schedules the verification via
-      // setTimeout(5000) (5s after spawn), and the verification itself can
-      // take up to 10s (TRACE_TIMEOUT_MS) for the proxy fetch + 8s for the
-      // real-IP fetch (run in parallel). At 7s we were checking
-      // store.get("vpn.connected") BEFORE verification had even started,
-      // so EVERY config reported "not connected" — quick-connect would skip
-      // working configs and fall through to the next source list. 20s gives
-      // 5s (internal setTimeout) + 10s (proxy fetch) + 5s buffer (SOCKS
-      // handshake + TLS + HTTP round-trip + real-IP fetch in parallel).
-      await new Promise((resolve) => setTimeout(resolve, 20000));
-      const vpnState = store.get("vpn");
+      // If we reach here, startVpnEngine succeeded — the tunnel is verified.
+      log.info(`Quick connect: SUCCESS — ${cfg.host} via ${cfg.source}`);
 
-      if (vpnState.connected) {
-        log.info(`Quick connect: SUCCESS — ${cfg.host} via ${cfg.source}`);
+      try {
+        const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
+        fs.writeFileSync(cacheFile, JSON.stringify({
+          uri: cfg.uri,
+          protocol: cfg.protocol,
+          host: cfg.host,
+          port: cfg.port,
+          country: cfg.country,
+          timestamp: Date.now(),
+        }));
+      } catch {}
 
-        try {
-          const cacheFile = path.join(app.getPath("userData"), "last-working-config.json");
-          fs.writeFileSync(cacheFile, JSON.stringify({
-            uri: cfg.uri,
-            protocol: cfg.protocol,
-            host: cfg.host,
-            port: cfg.port,
-            country: cfg.country,
-            timestamp: Date.now(),
-          }));
-        } catch {}
-
-        // Preserve offline fallback data until a config has actually worked.
-        // Put the known-good config first for the next launch.
-        const remaining = configs.filter((candidate) => candidate.uri !== cfg.uri);
-        writeCachedConfigs([cfg, ...remaining]);
-        return true;
-      }
-
-      log.warn(`Quick connect: Xray did not verify a tunnel through ${cfg.host}; trying next`);
-      await stopVpnEngine();
+      // Preserve offline fallback data until a config has actually worked.
+      // Put the known-good config first for the next launch.
+      const remaining = configs.filter((candidate) => candidate.uri !== cfg.uri);
+      writeCachedConfigs([cfg, ...remaining]);
+      return true;
     } catch (e: any) {
+      // startVpnEngine threw — either bind error, early exit, or verification
+      // failure. Log and move to the next config (failover).
       log.warn(`Quick connect: Xray failed for ${cfg.host}:${cfg.port}: ${e?.message}; trying next`);
       await stopVpnEngine().catch(() => {});
     }
@@ -1960,6 +2094,14 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
       log.error(`[companion-api] xray binary not found at: ${xrayPath}`);
       return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
     }
+    // DIAGNOSTIC: log binary path + size for crash investigation.
+    try {
+      const xrayStat = fs.statSync(xrayPath);
+      log.info(`[companion-api] xray binary: path=${xrayPath}, size=${xrayStat.size} bytes, modified=${xrayStat.mtime.toISOString()}`);
+    } catch (e: any) {
+      log.error(`[companion-api] xray binary stat failed: ${e?.message}`);
+      return { ok: false, error: `VPN engine binary inaccessible: ${e?.message}` };
+    }
 
     // PRE-FLIGHT VALIDATION (v1.0.34): run `xray run -test -c config.json` to
     // validate the config WITHOUT starting the tunnel. This catches 90% of
@@ -2016,6 +2158,10 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     // in the response when xray exits immediately (v1.0.34).
     let stderrBuffer = "";
     const MAX_STDERR_BUFFER = 4096; // 4KB — enough for the last ~30 lines
+    // Track exit code + signal for diagnostic error reporting.
+    let lastExitCode: number | null = null;
+    let lastExitSignal: string | null = null;
+    let spawnError: string | null = null;
 
     try {
       vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
@@ -2047,8 +2193,11 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
           stderrBuffer = stderrBuffer.slice(-MAX_STDERR_BUFFER);
         }
       });
-      vpnProcess.on("exit", (code) => {
-        log.info(`[companion-api] xray exited with code ${code}`);
+      vpnProcess.on("exit", (code, signal) => {
+        // DIAGNOSTIC: log BOTH code and signal.
+        log.info(`[companion-api] xray exited: code=${code}, signal=${signal}`);
+        lastExitCode = code;
+        lastExitSignal = signal;
         // STALE GUARD: don't let a stale exit overwrite a newer connection state.
         if (companionAttemptId !== currentVerifyAttempt) {
           log.info(`[companion-api] stale exit from attempt ${companionAttemptId} — dropping`);
@@ -2066,15 +2215,29 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
         }
       });
 
+      // DIAGNOSTIC: spawn error handler — catches EACCES, EPERM, ENOENT,
+      // or any other error that prevents the process from starting.
+      // Without this, a spawn error is uncaught and the function would
+      // return a generic "no stderr output" error after the 2s timeout.
+      vpnProcess.on("error", (err: any) => {
+        const code = err?.code || "unknown";
+        log.error(`[companion-api] xray SPAWN ERROR: ${err?.message || err} (code: ${code})`);
+        spawnError = `${err?.message || err} (code: ${code})`;
+      });
+
       // Wait for xray to start (2s — increased from 500ms in v1.0.34).
-      // 500ms was too short: xray-core's TUN device setup, DNS resolver init,
-      // and SOCKS/HTTP listener binding can take 1-2 seconds on slower machines.
       await new Promise((r) => setTimeout(r, 2000));
 
       if (!vpnProcess || vpnProcess.killed) {
-        // xray exited within 2s — include the actual stderr so the user knows WHY.
+        // xray exited within 2s — include stderr + exitCode + signal + spawnError.
         const lastErr = stderrBuffer.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
-        const detail = lastErr || "no stderr output (xray binary may be missing or corrupted)";
+        const exitInfo = lastExitCode !== null ? ` (exit code: ${lastExitCode}, signal: ${lastExitSignal})` : "";
+        const spawnInfo = spawnError ? ` [spawn error: ${spawnError}]` : "";
+        const detail = lastErr
+          ? `${lastErr}${exitInfo}`
+          : spawnError
+            ? `${spawnError}${exitInfo}`
+            : `no stderr output${exitInfo} (xray binary may be missing, corrupted, or blocked by antivirus)${spawnInfo}`;
         return {
           ok: false,
           error: `xray crashed on startup: ${detail}`,
@@ -2815,6 +2978,43 @@ function stopAutoUpdater(): void {
 import { spawn as spawnChild } from "child_process";
 
 let nextServer: ReturnType<typeof spawnChild> | null = null;
+let nextServerCleanupFired = false;
+
+// stopNextServer — idempotent cleanup for the Next.js child process.
+function stopNextServer(): void {
+  if (nextServerCleanupFired) return;
+  nextServerCleanupFired = true;
+
+  const proc = nextServer;
+  nextServer = null;
+
+  if (!proc || proc.killed) {
+    return;
+  }
+
+  log.info("stopNextServer: stopping Next.js standalone server…");
+
+  try {
+    proc.kill("SIGTERM");
+  } catch (e: any) {
+    log.warn(`stopNextServer: SIGTERM failed (${e?.message}) — escalating to SIGKILL`);
+    try { proc.kill("SIGKILL"); } catch {}
+    return;
+  }
+
+  setTimeout(() => {
+    try {
+      if (!proc.killed) {
+        log.warn("stopNextServer: child did not exit within 2s of SIGTERM — sending SIGKILL");
+        proc.kill("SIGKILL");
+      }
+    } catch (e: any) {
+      if (e?.code !== "ESRCH") {
+        log.warn(`stopNextServer: SIGKILL failed (${e?.message})`);
+      }
+    }
+  }, 2000);
+}
 
 function getNextStandalonePath(): string {
   const isDev = !!process.env.DISTORT_DEV;
@@ -2833,9 +3033,9 @@ function startNextServer(): Promise<void> {
     log.info(`Starting Next.js standalone server from: ${serverJs}`);
 
     if (!fs.existsSync(serverJs)) {
-      log.warn(`Next.js standalone server.js not found at ${serverJs}`);
-      log.info("Will use offline page as fallback");
-      resolve();
+      log.error(`Next.js standalone server.js not found at ${serverJs}`);
+      log.error("Dashboard will NOT load — build is broken (next-standalone missing from package)");
+      reject(new Error(`server.js not found at ${serverJs} — build is broken`));
       return;
     }
 
@@ -2886,19 +3086,39 @@ function startNextServer(): Promise<void> {
           ELECTRON_RUN_AS_NODE: "1",
           DATABASE_URL: `file:${dbPath}`,
           DISTORT_SESSION_SECRET: process.env.DISTORT_SESSION_SECRET || "distort-desktop-session-secret-local",
-          // CRITICAL: set a local API key so checkAuth() doesn't return 503.
-          // The client (web dashboard) sends this key via x-api-key header.
-          // We inject it into the browser via preload.ts → window.distort.apiKey
           DISTORT_API_KEY: "distort-desktop-local-api-key-for-localhost-only-32chars",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      nextServer.stdout?.on("data", (data) => {
+      const proc = nextServer;
+      let settled = false;
+
+      proc.stdout?.on("data", (data) => {
         log.info(`[next] ${data.toString().trim()}`);
       });
-      nextServer.stderr?.on("data", (data) => {
+      proc.stderr?.on("data", (data) => {
         log.error(`[next] ${data.toString().trim()}`);
+      });
+
+      proc.on("error", (err: Error) => {
+        log.error(`Next.js server spawn error: ${err.message}`);
+        if (!settled) {
+          settled = true;
+          if (nextServer === proc) nextServer = null;
+          reject(new Error(`Failed to spawn Next.js server: ${err.message}`));
+        }
+      });
+
+      proc.on("exit", (code, signal) => {
+        log.warn(`Next.js server exited: code=${code} signal=${signal}`);
+        if (nextServer === proc) {
+          nextServer = null;
+        }
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Next.js server exited before becoming ready (code=${code}, signal=${signal})`));
+        }
       });
 
       // Wait for server to be ready
@@ -2909,15 +3129,21 @@ function startNextServer(): Promise<void> {
           .then((r) => {
             if (r.ok) {
               clearInterval(checkInterval);
-              log.info("Next.js standalone server is ready on port 38571");
-              resolve();
+              if (!settled) {
+                settled = true;
+                log.info("Next.js standalone server is ready on port 38571");
+                resolve();
+              }
             }
           })
           .catch(() => {
             if (attempts > 20) {
               clearInterval(checkInterval);
-              log.warn("Next.js server didn't start in time");
-              resolve();
+              if (!settled) {
+                settled = true;
+                log.error("Next.js server didn't start within 10s (20 attempts × 500ms) — rejecting");
+                reject(new Error("Next.js server startup timeout (10s)"));
+              }
             }
           });
       }, 500);
@@ -3089,8 +3315,23 @@ app.whenReady().then(async () => {
     log.warn(`Crash recovery check failed: ${e?.message}`);
   }
 
-  // Start Next.js standalone server first (if available)
-  await startNextServer();
+  // Start Next.js standalone server first (if available).
+  try {
+    await startNextServer();
+    log.info("Dashboard server started successfully — loading dashboard URL");
+  } catch (e: any) {
+    log.error("============================================================");
+    log.error("DASHBOARD SERVER FAILED TO START");
+    log.error(`Reason: ${e?.message || e}`);
+    log.error("The app will load the offline page instead.");
+    log.error("Possible causes:");
+    log.error("  1. Build is broken — next-standalone/server.js missing from package");
+    log.error("  2. Port 38571 is already in use (another DISTORT instance?)");
+    log.error("  3. Database initialization failed");
+    log.error("  4. Next.js server crashed during startup");
+    log.error("Check the [next] log lines above for server-side errors.");
+    log.error("============================================================");
+  }
 
   createWindow();
   createTray();
@@ -3212,6 +3453,10 @@ app.on("before-quit", async (e) => {
   // CRITICAL: Always disable kill switch on quit, otherwise the user's internet
   // would be permanently blocked if the app crashed while kill switch was active.
   await disableKillSwitch();
+  // Stop the Next.js standalone server (port 38571) — without this, the child
+  // process (named DISTORT.exe on Windows) keeps running after the parent exits,
+  // causing orphaned-process accumulation across multiple launches.
+  stopNextServer();
   // Stop the companion control API server (port 10810).
   stopCompanionApiServer();
   // Stop the auto-updater's periodic check timer.
@@ -3227,6 +3472,7 @@ process.on("SIGINT", async () => {
   log.info("Received SIGINT — cleaning up…");
   await stopVpnEngine();
   await disableKillSwitch();
+  stopNextServer();
   stopCompanionApiServer();
   stopAutoUpdater();
   process.exit(0);
@@ -3235,6 +3481,7 @@ process.on("SIGTERM", async () => {
   log.info("Received SIGTERM — cleaning up…");
   await stopVpnEngine();
   await disableKillSwitch();
+  stopNextServer();
   stopCompanionApiServer();
   stopAutoUpdater();
   process.exit(0);
@@ -3246,6 +3493,7 @@ process.on("uncaughtException", async (err) => {
   try {
     await stopVpnEngine();
     await disableKillSwitch();
+    stopNextServer();
     stopCompanionApiServer();
     stopAutoUpdater();
   } catch {}
