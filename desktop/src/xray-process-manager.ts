@@ -44,66 +44,127 @@ import * as net from "net";
 //   - Instead we do a TCP connect probe: if connect succeeds, the port is
 //     in use (and we close our socket immediately without sending data).
 //   - If connect fails with ECONNREFUSED, the port is free.
+//   - On timeout or non-ECONNREFUSED errors, the port state is UNKNOWN —
+//     we must NOT assume it's free, because a firewall or network issue
+//     could cause a false "free" reading and lead to a bind failure.
 //   - The caller is responsible for logging the PID/path of the occupying
 //     process if needed (via CIM/WMI on Windows).
 // ---------------------------------------------------------------------------
 
+export type PortProbeState = "free" | "in-use" | "unknown";
+
 export type PortOwnerCheckResult = {
   port: number;
   inUse: boolean;
+  /** Detailed state: "free" (definitely free), "in-use" (definitely occupied),
+   *  "unknown" (timeout or non-ECONNREFUSED error — cannot determine). */
+  state: PortProbeState;
+  /** Error code if state is "unknown" (e.g. "ETIMEDOUT", "EACCES"). */
+  errorCode?: string;
   /** Time in ms spent probing (useful for logging). */
   probeMs: number;
 };
 
 /**
  * Check if a TCP port on 127.0.0.1 is currently in use (without terminating
- * the occupying process). Returns { port, inUse, probeMs }.
+ * the occupying process). Returns { port, inUse, state, errorCode, probeMs }.
  *
  * Safe: never throws, never kills anything. Just probes.
+ *
+ * State semantics:
+ *   - "free": connect failed with ECONNREFUSED → port is definitely free
+ *   - "in-use": connect succeeded → port is definitely occupied
+ *   - "unknown": timeout or non-ECONNREFUSED error → cannot determine
+ *
+ * The caller should treat "unknown" conservatively. For pre-bind checks,
+ * treating "unknown" as "in-use" (refuse to spawn) is the safe default —
+ * it prevents a potential bind failure, at the cost of a false refusal
+ * in rare network-error cases.
  */
 export async function checkPortInUse(port: number): Promise<PortOwnerCheckResult> {
   const start = Date.now();
-  const inUse = await new Promise<boolean>((resolve) => {
+  const result = await new Promise<{ state: PortProbeState; errorCode?: string }>((resolve) => {
     const s = new net.Socket();
     s.setTimeout(500);
+    let settled = false;
+    const finish = (state: PortProbeState, errorCode?: string) => {
+      if (settled) return;
+      settled = true;
+      s.destroy();
+      resolve({ state, errorCode });
+    };
     s.once("connect", () => {
       // Connect succeeded → port IS in use by a listening server.
-      s.destroy();
-      resolve(true);
+      finish("in-use");
     });
-    s.once("error", () => {
-      // ECONNREFUSED or other → port is free.
-      s.destroy();
-      resolve(false);
+    s.once("error", (err: any) => {
+      const code = err?.code;
+      if (code === "ECONNREFUSED") {
+        // ECONNREFUSED → port is definitely free (no listener on it).
+        finish("free", code);
+      } else {
+        // EACCES, EADDRINUSE (on our own socket), ENETUNREACH, etc. → unknown.
+        // We cannot determine if the port is free or occupied.
+        finish("unknown", code);
+      }
     });
     s.once("timeout", () => {
-      // Timed out → treat as free (a bound port would accept faster).
-      s.destroy();
-      resolve(false);
+      // Timed out → cannot determine. A bound port on localhost should
+      // accept within milliseconds; a timeout suggests a network issue,
+      // firewall, or OS-level problem. Treat as unknown, not free.
+      finish("unknown", "ETIMEDOUT");
     });
     s.connect(port, "127.0.0.1");
   });
-  return { port, inUse, probeMs: Date.now() - start };
+  return {
+    port,
+    inUse: result.state === "in-use",
+    state: result.state,
+    errorCode: result.errorCode,
+    probeMs: Date.now() - start,
+  };
 }
 
 /**
- * Check BOTH xray inbound ports (SOCKS5 + HTTP proxy). Returns true if EITHER
- * is in use. Used before spawning a new xray to detect port conflicts early
- * and fail fast with a clear error instead of letting xray crash with
- * "bind: Only one usage of each socket address".
+ * Check BOTH xray inbound ports (SOCKS5 + HTTP proxy).
+ *
+ * Returns:
+ *   - socksInUse / httpInUse: true only if the probe definitively confirmed
+ *     the port is occupied (state === "in-use").
+ *   - anyInUse: true if EITHER port is "in-use" OR "unknown" (conservative —
+ *     refuse to spawn if we can't confirm both ports are free).
+ *   - anyUnknown: true if either probe returned "unknown" (for logging).
+ *
+ * The caller should treat anyInUse === true as "do not spawn" — either the
+ * port is definitely occupied, or we can't confirm it's free.
  */
 export async function checkXrayPortsInUse(
   socksPort: number = DEFAULT_SOCKS_PORT,
   httpPort: number = DEFAULT_HTTP_PORT,
-): Promise<{ socksInUse: boolean; httpInUse: boolean; anyInUse: boolean }> {
+): Promise<{
+  socksInUse: boolean;
+  httpInUse: boolean;
+  anyInUse: boolean;
+  anyUnknown: boolean;
+  socksState: PortProbeState;
+  httpState: PortProbeState;
+  socksErrorCode?: string;
+  httpErrorCode?: string;
+}> {
   const [socks, http] = await Promise.all([
     checkPortInUse(socksPort),
     checkPortInUse(httpPort),
   ]);
   return {
-    socksInUse: socks.inUse,
-    httpInUse: http.inUse,
-    anyInUse: socks.inUse || http.inUse,
+    socksInUse: socks.state === "in-use",
+    httpInUse: http.state === "in-use",
+    // Conservative: treat "unknown" as occupied to avoid bind failures.
+    anyInUse: socks.state === "in-use" || http.state === "in-use" || socks.state === "unknown" || http.state === "unknown",
+    anyUnknown: socks.state === "unknown" || http.state === "unknown",
+    socksState: socks.state,
+    httpState: http.state,
+    socksErrorCode: socks.errorCode,
+    httpErrorCode: http.errorCode,
   };
 }
 

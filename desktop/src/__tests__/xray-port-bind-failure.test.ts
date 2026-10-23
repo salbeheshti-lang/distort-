@@ -100,32 +100,35 @@ function cleanupScript(scriptPath: string) {
 // ---------------------------------------------------------------------------
 
 describe("checkPortInUse", () => {
-  test("returns false when port is free", async () => {
+  test("returns state='free' when port is free (ECONNREFUSED)", async () => {
     // Use a high port that's unlikely to be in use
     const port = 40000 + Math.floor(Math.random() * 1000);
     const result = await checkPortInUse(port);
     expect(result.inUse).toBe(false);
+    expect(result.state).toBe("free");
     expect(result.probeMs).toBeGreaterThanOrEqual(0);
   });
 
-  test("returns true when port is occupied by a listening server", async () => {
+  test("returns state='in-use' when port is occupied by a listening server", async () => {
     const port = 40000 + Math.floor(Math.random() * 1000);
     const occupier = await startOccupier(port);
     try {
       const result = await checkPortInUse(port);
       expect(result.inUse).toBe(true);
+      expect(result.state).toBe("in-use");
     } finally {
       await occupier.stop();
     }
   });
 
-  test("returns false after the occupying server is stopped", async () => {
+  test("returns state='free' after the occupying server is stopped", async () => {
     const port = 40000 + Math.floor(Math.random() * 1000);
     const occupier = await startOccupier(port);
     await occupier.stop();
     // Give the OS a moment to release the port
     await new Promise((r) => setTimeout(r, 100));
     const result = await checkPortInUse(port);
+    expect(result.state).toBe("free");
     expect(result.inUse).toBe(false);
   });
 });
@@ -370,6 +373,256 @@ describe("concurrent startVpnEngine mutex logic", () => {
     expect(spawnCount).toBe(1); // only one spawn happened
 
     await p1; // wait for first to complete
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INTEGRATION TEST: Simulates the real Quick Connect failover flow with
+// actual xray startup failures (bind failure, early exit, verification failure).
+// Verifies:
+//   1. When xray fails to start, Quick Connect advances to the next config
+//   2. A failed connection never produces a false "connected" state
+//   3. The full failover loop completes (not hangs)
+//
+// This test uses REAL child processes (Node.js scripts as mock xray binaries)
+// and replicates the EXACT control flow of tryQuickConnectTier + startVpnEngine
+// from main.ts, but with Electron dependencies stubbed out.
+// ---------------------------------------------------------------------------
+
+describe("INTEGRATION: Quick Connect failover with real startup failures", () => {
+  // Replicate the essential state + logic from main.ts.
+  // We CANNOT import main.ts (Electron dependency), so we replicate the
+  // startupOutcome pattern and the tryQuickConnectTier loop.
+  type SimState = {
+    vpnConnected: boolean;
+    vpnOperationInProgress: boolean;
+    currentVerifyAttempt: number;
+    xrayStuck: boolean;
+    spawnedConfigs: string[];
+  };
+
+  function createSimState(): SimState {
+    return {
+      vpnConnected: false,
+      vpnOperationInProgress: false,
+      currentVerifyAttempt: 0,
+      xrayStuck: false,
+      spawnedConfigs: [],
+    };
+  }
+
+  // Simulate startVpnEngine with the startupOutcome pattern.
+  // Returns true on success, throws on failure (mirroring the real code).
+  async function simulatedStartVpnEngine(
+    state: SimState,
+    configHost: string,
+    opts: { exitImmediately?: boolean; bindSucceeds?: boolean; verifySucceeds?: boolean; bindPort?: number },
+  ): Promise<boolean> {
+    if (state.vpnOperationInProgress) {
+      throw new Error("Another VPN operation is in progress.");
+    }
+    state.vpnOperationInProgress = true;
+
+    try {
+      // PRE-BIND PORT CHECK (mirrors main.ts L485-507)
+      if (opts.bindPort !== undefined) {
+        const portCheck = await checkPortInUse(opts.bindPort);
+        if (portCheck.state === "in-use") {
+          throw new Error(`Cannot start xray: port ${opts.bindPort} already in use.`);
+        }
+        if (portCheck.state === "unknown") {
+          throw new Error(`Cannot start xray: port ${opts.bindPort} state unknown.`);
+        }
+      }
+
+      // Spawn mock xray
+      const script = createMockXrayScript({
+        exitImmediately: opts.exitImmediately,
+        bindPort: opts.bindSucceeds ? opts.bindPort : undefined,
+        ignoreSigterm: false,
+      });
+      const proc = spawn("node", [script]);
+      state.spawnedConfigs.push(configHost);
+
+      // STARTUP OUTCOME pattern
+      let resolveStartupOutcome!: (success: boolean) => void;
+      const startupOutcome = new Promise<boolean>((resolve) => { resolveStartupOutcome = resolve; });
+
+      // exit handler (mirrors main.ts L711-739)
+      proc.on("exit", (code) => {
+        if (!state.vpnConnected) {
+          // Early exit before handshake → fail
+          resolveStartupOutcome(false);
+        }
+      });
+
+      // Simulate the 5s verification timeout (shortened to 200ms for tests)
+      const startupTimeout = setTimeout(() => {
+        if (opts.verifySucceeds) {
+          state.vpnConnected = true;
+          resolveStartupOutcome(true);
+        } else {
+          resolveStartupOutcome(false);
+        }
+      }, 200);
+
+      // If exitImmediately, the exit handler will fire before the timeout
+      const success = await startupOutcome;
+      clearTimeout(startupTimeout);
+
+      // Cleanup: kill the process if still alive
+      try {
+        if (!proc.killed) {
+          proc.kill("SIGTERM");
+          await new Promise((r) => setTimeout(r, 50));
+          if (!proc.killed) proc.kill("SIGKILL");
+        }
+      } catch {}
+
+      cleanupScript(script);
+
+      if (!success) {
+        // Reset connected state on failure (mirrors main.ts)
+        state.vpnConnected = false;
+        throw new Error(`xray startup failed for ${configHost}`);
+      }
+      return true;
+    } finally {
+      state.vpnOperationInProgress = false;
+    }
+  }
+
+  // Replicate tryQuickConnectTier (mirrors main.ts L1788-1871)
+  async function simulatedTryQuickConnectTier(
+    state: SimState,
+    configs: Array<{ host: string; bindPort: number; exitImmediately?: boolean; bindSucceeds?: boolean; verifySucceeds?: boolean }>,
+  ): Promise<{ success: boolean; attemptedHosts: string[]; finalConnected: boolean }> {
+    const attemptedHosts: string[] = [];
+
+    for (const cfg of configs) {
+      attemptedHosts.push(cfg.host);
+      try {
+        await simulatedStartVpnEngine(state, cfg.host, cfg);
+        // Success — tunnel verified
+        return { success: true, attemptedHosts, finalConnected: state.vpnConnected };
+      } catch (e: any) {
+        // Failover to next config (mirrors main.ts catch block L1862-1867)
+        // Reset connected state
+        state.vpnConnected = false;
+      }
+    }
+    return { success: false, attemptedHosts, finalConnected: state.vpnConnected };
+  }
+
+  test("SCENARIO A: first config fails (bind error) → second config succeeds", async () => {
+    const state = createSimState();
+    const port1 = 48000 + Math.floor(Math.random() * 100);
+    const port2 = port1 + 1;
+
+    // Config 1: will fail because we pre-occupy its port.
+    // The pre-bind check detects this BEFORE spawn, so config 1 is never
+    // actually spawned — it's rejected at the port-check stage. This is
+    // the correct fail-fast behavior: no wasted spawn, no bind failure crash.
+    const occ1 = await startOccupier(port1);
+    try {
+      const result = await simulatedTryQuickConnectTier(state, [
+        { host: "server1.failed.example", bindPort: port1, bindSucceeds: false, verifySucceeds: false },
+        { host: "server2.success.example", bindPort: port2, bindSucceeds: true, verifySucceeds: true },
+      ]);
+
+      expect(result.success).toBe(true);
+      expect(result.attemptedHosts).toEqual(["server1.failed.example", "server2.success.example"]);
+      expect(result.finalConnected).toBe(true);
+      // Config 1 was rejected at pre-bind check (never spawned).
+      // Config 2 was actually spawned and succeeded.
+      expect(state.spawnedConfigs).not.toContain("server1.failed.example");
+      expect(state.spawnedConfigs).toContain("server2.success.example");
+    } finally {
+      await occ1.stop();
+    }
+  });
+
+  test("SCENARIO B: xray exits immediately (code -1) → failover to next", async () => {
+    const state = createSimState();
+    const port1 = 48200 + Math.floor(Math.random() * 100);
+    const port2 = port1 + 1;
+
+    const result = await simulatedTryQuickConnectTier(state, [
+      { host: "broken1.example", bindPort: port1, exitImmediately: true, verifySucceeds: false },
+      { host: "working1.example", bindPort: port2, bindSucceeds: true, verifySucceeds: true },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.attemptedHosts).toHaveLength(2);
+    expect(result.finalConnected).toBe(true);
+  });
+
+  test("SCENARIO C: all configs fail → returns false, no false connected state", async () => {
+    const state = createSimState();
+    const port1 = 48400 + Math.floor(Math.random() * 100);
+    const port2 = port1 + 1;
+    const port3 = port1 + 2;
+
+    const result = await simulatedTryQuickConnectTier(state, [
+      { host: "fail1.example", bindPort: port1, exitImmediately: true, verifySucceeds: false },
+      { host: "fail2.example", bindPort: port2, exitImmediately: true, verifySucceeds: false },
+      { host: "fail3.example", bindPort: port3, exitImmediately: true, verifySucceeds: false },
+    ]);
+
+    expect(result.success).toBe(false);
+    expect(result.attemptedHosts).toHaveLength(3);
+    // CRITICAL: no false "connected" state
+    expect(result.finalConnected).toBe(false);
+    expect(state.vpnConnected).toBe(false);
+  });
+
+  test("SCENARIO D: bind succeeds but verification fails → failover", async () => {
+    const state = createSimState();
+    const port1 = 48600 + Math.floor(Math.random() * 100);
+    const port2 = port1 + 1;
+
+    const result = await simulatedTryQuickConnectTier(state, [
+      { host: "verify-fail.example", bindPort: port1, bindSucceeds: true, verifySucceeds: false },
+      { host: "verify-ok.example", bindPort: port2, bindSucceeds: true, verifySucceeds: true },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.attemptedHosts).toHaveLength(2);
+    expect(result.finalConnected).toBe(true);
+    // First config was spawned but failed verification — second succeeded
+    expect(state.spawnedConfigs[0]).toBe("verify-fail.example");
+    expect(state.spawnedConfigs[1]).toBe("verify-ok.example");
+  });
+
+  test("SCENARIO E: first config succeeds → does NOT try second (no unnecessary failover)", async () => {
+    const state = createSimState();
+    const port1 = 48800 + Math.floor(Math.random() * 100);
+
+    const result = await simulatedTryQuickConnectTier(state, [
+      { host: "first-success.example", bindPort: port1, bindSucceeds: true, verifySucceeds: true },
+      { host: "should-not-try.example", bindPort: port1 + 1, bindSucceeds: true, verifySucceeds: true },
+    ]);
+
+    expect(result.success).toBe(true);
+    expect(result.attemptedHosts).toEqual(["first-success.example"]);
+    expect(state.spawnedConfigs).toEqual(["first-success.example"]);
+    // Second config was NOT spawned
+    expect(state.spawnedConfigs).not.toContain("should-not-try.example");
+  });
+
+  test("SCENARIO F: no false connected state if all failover paths fail", async () => {
+    const state = createSimState();
+    const port1 = 49000 + Math.floor(Math.random() * 100);
+
+    // Even after partial success then failure
+    const result = await simulatedTryQuickConnectTier(state, [
+      { host: "partial.example", bindPort: port1, bindSucceeds: true, verifySucceeds: false },
+      { host: "also-bad.example", bindPort: port1 + 1, exitImmediately: true, verifySucceeds: false },
+    ]);
+
+    expect(result.success).toBe(false);
+    expect(result.finalConnected).toBe(false);
+    expect(state.vpnConnected).toBe(false);
   });
 });
 

@@ -484,21 +484,25 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     // loop iteration, which handles cleanup properly.
     const portCheck = await checkXrayPortsInUse(10808, 10809);
     if (portCheck.anyInUse) {
-      const which = [];
+      const which: string[] = [];
       if (portCheck.socksInUse) which.push(`10808 (SOCKS5)`);
       if (portCheck.httpInUse) which.push(`10809 (HTTP proxy)`);
+      if (portCheck.anyUnknown) {
+        which.push(`port(s) with indeterminate state (socks=${portCheck.socksState}/${portCheck.socksErrorCode ?? "ok"}, http=${portCheck.httpState}/${portCheck.httpErrorCode ?? "ok"})`);
+      }
       log.error(
-        `startVpnEngine: ABORTING spawn — port(s) already in use: ${which.join(", ")}. ` +
+        `startVpnEngine: ABORTING spawn — port(s) not confirmed free: ${which.join(", ")}. ` +
         `vpnProcess is ${vpnProcess ? `PID=${vpnProcess.pid}` : "null"}. ` +
-        `Possible cause: previous xray did not release ports, or another process is bound.`
+        `Possible cause: previous xray did not release ports, another process is bound, ` +
+        `or a network/firewall issue prevented port probing.`
       );
       // Do NOT set xrayStuck here — that would permanently block failover.
       // Instead, throw so the caller (tryQuickConnectTier) can call
       // stopVpnEngine() and retry. If stopVpnEngine can't clear the port,
       // IT will set xrayStuck (which is the correct place).
       throw new Error(
-        `Cannot start xray: port(s) ${which.join(", ")} already in use. ` +
-        `Previous xray process may not have released ports.`
+        `Cannot start xray: port(s) not confirmed free: ${which.join(", ")}. ` +
+        `Previous xray process may not have released ports, or a network issue prevented probing.`
       );
     }
 
