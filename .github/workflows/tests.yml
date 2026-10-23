@@ -136,3 +136,32 @@ jobs:
       - name: Run desktop xray-port-bind-failure tests
         working-directory: desktop
         run: bun test src/__tests__/xray-port-bind-failure.test.ts
+
+  # ─── Windows test job ────────────────────────────────────────────────────
+  # Verifies the port-bind failure + deadlock fixes on Windows, where:
+  #   - SIGTERM maps to TerminateProcess (no graceful signal delivery)
+  #   - SIGKILL maps to TerminateProcess (same as SIGTERM)
+  #   - Port release timing may differ (TIME_WAIT behavior)
+  #   - ECONNREFUSED is returned the same way as Linux
+  #
+  # This job runs ONLY the xray-port-bind-failure tests (not the full
+  # desktop suite) to keep CI fast and focused on the Windows-specific
+  # behavior of the port-bind fix.
+  #
+  # setup-node is required because the test file uses spawn("node", [script])
+  # to launch mock xray binaries. Without setup-node, "node" may not be in
+  # PATH on the Windows runner.
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 'lts' }
+      - uses: oven-sh/setup-bun@v1
+        with: { bun-version: latest }
+      - name: Install desktop deps
+        working-directory: desktop
+        run: bun install
+      - name: Run desktop xray-port-bind-failure tests (Windows)
+        working-directory: desktop
+        run: bun test src/__tests__/xray-port-bind-failure.test.ts
