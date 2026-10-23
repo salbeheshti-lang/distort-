@@ -33,6 +33,81 @@ import type { ChildProcess } from "child_process";
 import * as net from "net";
 
 // ---------------------------------------------------------------------------
+// Port-owner detection — used BEFORE spawning a new xray to detect if the
+// port is already occupied (by a stale xray from a previous run, or by an
+// unrelated process). This is SAFE: it only reads the port state, never
+// terminates the occupying process.
+//
+// Design notes:
+//   - We do NOT use Get-NetTCPConnection / netstat from here because that
+//     requires spawning a child process on Windows and is harder to test.
+//   - Instead we do a TCP connect probe: if connect succeeds, the port is
+//     in use (and we close our socket immediately without sending data).
+//   - If connect fails with ECONNREFUSED, the port is free.
+//   - The caller is responsible for logging the PID/path of the occupying
+//     process if needed (via CIM/WMI on Windows).
+// ---------------------------------------------------------------------------
+
+export type PortOwnerCheckResult = {
+  port: number;
+  inUse: boolean;
+  /** Time in ms spent probing (useful for logging). */
+  probeMs: number;
+};
+
+/**
+ * Check if a TCP port on 127.0.0.1 is currently in use (without terminating
+ * the occupying process). Returns { port, inUse, probeMs }.
+ *
+ * Safe: never throws, never kills anything. Just probes.
+ */
+export async function checkPortInUse(port: number): Promise<PortOwnerCheckResult> {
+  const start = Date.now();
+  const inUse = await new Promise<boolean>((resolve) => {
+    const s = new net.Socket();
+    s.setTimeout(500);
+    s.once("connect", () => {
+      // Connect succeeded → port IS in use by a listening server.
+      s.destroy();
+      resolve(true);
+    });
+    s.once("error", () => {
+      // ECONNREFUSED or other → port is free.
+      s.destroy();
+      resolve(false);
+    });
+    s.once("timeout", () => {
+      // Timed out → treat as free (a bound port would accept faster).
+      s.destroy();
+      resolve(false);
+    });
+    s.connect(port, "127.0.0.1");
+  });
+  return { port, inUse, probeMs: Date.now() - start };
+}
+
+/**
+ * Check BOTH xray inbound ports (SOCKS5 + HTTP proxy). Returns true if EITHER
+ * is in use. Used before spawning a new xray to detect port conflicts early
+ * and fail fast with a clear error instead of letting xray crash with
+ * "bind: Only one usage of each socket address".
+ */
+export async function checkXrayPortsInUse(
+  socksPort: number = DEFAULT_SOCKS_PORT,
+  httpPort: number = DEFAULT_HTTP_PORT,
+): Promise<{ socksInUse: boolean; httpInUse: boolean; anyInUse: boolean }> {
+  const [socks, http] = await Promise.all([
+    checkPortInUse(socksPort),
+    checkPortInUse(httpPort),
+  ]);
+  return {
+    socksInUse: socks.inUse,
+    httpInUse: http.inUse,
+    anyInUse: socks.inUse || http.inUse,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -161,6 +236,23 @@ export async function stopXrayProcess(
   let stuck = false;
   let portsReleased = false;
 
+  // ALREADY-EXITED CHECK: if the process already exited before stopXrayProcess
+  // was called (common in the bind-failure path: xray spawns, fails to bind,
+  // exits with code -1 within ~100ms, and by the time the caller calls
+  // stopVpnEngine → stopXrayProcess, the 'exit' event has ALREADY fired).
+  //
+  // Node.js ChildProcess only emits 'exit' ONCE. If we register a listener
+  // after it already fired, our listener never runs, and we'd time out and
+  // incorrectly declare the process "stuck".
+  //
+  // Fix: check proc.exitCode / proc.signalCode — if either is non-null, the
+  // process has already exited. Skip directly to port probing.
+  const alreadyExited = proc.exitCode !== null || proc.signalCode !== null;
+  if (alreadyExited) {
+    log("info", `stopXrayProcess: process already exited (code=${proc.exitCode}, signal=${proc.signalCode}) — skipping kill, probing ports`);
+    didExit = true;
+  }
+
   // Single named exit listener — avoids the listener-leak bug from v3.
   let sigtermResolved = false;
   let resolveSigterm: (v: boolean) => void = () => {};
@@ -180,24 +272,26 @@ export async function stopXrayProcess(
     }
   };
 
-  // Phase 1: SIGTERM with timeout.
-  const exited = await new Promise<boolean>((resolve) => {
-    resolveSigterm = resolve;
-    exitTimeout = setTimeout(() => {
-      if (sigtermResolved) return;
-      sigtermResolved = true;
-      resolve(false);
-    }, sigtermTimeoutMs);
-    proc.once("exit", onExit);
-    try {
-      proc.kill("SIGTERM");
-    } catch (e: any) {
-      log("warn", `stopXrayProcess: SIGTERM failed (${e?.message}) — trying SIGKILL directly`);
-      clearTimeout(exitTimeout);
-      try { proc.kill("SIGKILL"); } catch {}
-      resolve(false);
-    }
-  });
+  // Phase 1: SIGTERM with timeout (skip if already exited).
+  const exited = await (alreadyExited
+    ? Promise.resolve(true)
+    : new Promise<boolean>((resolve) => {
+        resolveSigterm = resolve;
+        exitTimeout = setTimeout(() => {
+          if (sigtermResolved) return;
+          sigtermResolved = true;
+          resolve(false);
+        }, sigtermTimeoutMs);
+        proc.once("exit", onExit);
+        try {
+          proc.kill("SIGTERM");
+        } catch (e: any) {
+          log("warn", `stopXrayProcess: SIGTERM failed (${e?.message}) — trying SIGKILL directly`);
+          clearTimeout(exitTimeout);
+          try { proc.kill("SIGKILL"); } catch {}
+          resolve(false);
+        }
+      }));
 
   // Phase 2: SIGKILL if SIGTERM didn't cause exit.
   if (!exited && !didExit) {
