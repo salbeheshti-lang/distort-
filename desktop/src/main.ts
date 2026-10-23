@@ -2925,6 +2925,43 @@ function stopAutoUpdater(): void {
 import { spawn as spawnChild } from "child_process";
 
 let nextServer: ReturnType<typeof spawnChild> | null = null;
+let nextServerCleanupFired = false;
+
+// stopNextServer — idempotent cleanup for the Next.js child process.
+function stopNextServer(): void {
+  if (nextServerCleanupFired) return;
+  nextServerCleanupFired = true;
+
+  const proc = nextServer;
+  nextServer = null;
+
+  if (!proc || proc.killed) {
+    return;
+  }
+
+  log.info("stopNextServer: stopping Next.js standalone server…");
+
+  try {
+    proc.kill("SIGTERM");
+  } catch (e: any) {
+    log.warn(`stopNextServer: SIGTERM failed (${e?.message}) — escalating to SIGKILL`);
+    try { proc.kill("SIGKILL"); } catch {}
+    return;
+  }
+
+  setTimeout(() => {
+    try {
+      if (!proc.killed) {
+        log.warn("stopNextServer: child did not exit within 2s of SIGTERM — sending SIGKILL");
+        proc.kill("SIGKILL");
+      }
+    } catch (e: any) {
+      if (e?.code !== "ESRCH") {
+        log.warn(`stopNextServer: SIGKILL failed (${e?.message})`);
+      }
+    }
+  }, 2000);
+}
 
 function getNextStandalonePath(): string {
   const isDev = !!process.env.DISTORT_DEV;
@@ -2943,9 +2980,9 @@ function startNextServer(): Promise<void> {
     log.info(`Starting Next.js standalone server from: ${serverJs}`);
 
     if (!fs.existsSync(serverJs)) {
-      log.warn(`Next.js standalone server.js not found at ${serverJs}`);
-      log.info("Will use offline page as fallback");
-      resolve();
+      log.error(`Next.js standalone server.js not found at ${serverJs}`);
+      log.error("Dashboard will NOT load — build is broken (next-standalone missing from package)");
+      reject(new Error(`server.js not found at ${serverJs} — build is broken`));
       return;
     }
 
@@ -2996,19 +3033,39 @@ function startNextServer(): Promise<void> {
           ELECTRON_RUN_AS_NODE: "1",
           DATABASE_URL: `file:${dbPath}`,
           DISTORT_SESSION_SECRET: process.env.DISTORT_SESSION_SECRET || "distort-desktop-session-secret-local",
-          // CRITICAL: set a local API key so checkAuth() doesn't return 503.
-          // The client (web dashboard) sends this key via x-api-key header.
-          // We inject it into the browser via preload.ts → window.distort.apiKey
           DISTORT_API_KEY: "distort-desktop-local-api-key-for-localhost-only-32chars",
         },
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      nextServer.stdout?.on("data", (data) => {
+      const proc = nextServer;
+      let settled = false;
+
+      proc.stdout?.on("data", (data) => {
         log.info(`[next] ${data.toString().trim()}`);
       });
-      nextServer.stderr?.on("data", (data) => {
+      proc.stderr?.on("data", (data) => {
         log.error(`[next] ${data.toString().trim()}`);
+      });
+
+      proc.on("error", (err: Error) => {
+        log.error(`Next.js server spawn error: ${err.message}`);
+        if (!settled) {
+          settled = true;
+          if (nextServer === proc) nextServer = null;
+          reject(new Error(`Failed to spawn Next.js server: ${err.message}`));
+        }
+      });
+
+      proc.on("exit", (code, signal) => {
+        log.warn(`Next.js server exited: code=${code} signal=${signal}`);
+        if (nextServer === proc) {
+          nextServer = null;
+        }
+        if (!settled) {
+          settled = true;
+          reject(new Error(`Next.js server exited before becoming ready (code=${code}, signal=${signal})`));
+        }
       });
 
       // Wait for server to be ready
@@ -3019,15 +3076,21 @@ function startNextServer(): Promise<void> {
           .then((r) => {
             if (r.ok) {
               clearInterval(checkInterval);
-              log.info("Next.js standalone server is ready on port 38571");
-              resolve();
+              if (!settled) {
+                settled = true;
+                log.info("Next.js standalone server is ready on port 38571");
+                resolve();
+              }
             }
           })
           .catch(() => {
             if (attempts > 20) {
               clearInterval(checkInterval);
-              log.warn("Next.js server didn't start in time");
-              resolve();
+              if (!settled) {
+                settled = true;
+                log.error("Next.js server didn't start within 10s (20 attempts × 500ms) — rejecting");
+                reject(new Error("Next.js server startup timeout (10s)"));
+              }
             }
           });
       }, 500);
@@ -3199,8 +3262,23 @@ app.whenReady().then(async () => {
     log.warn(`Crash recovery check failed: ${e?.message}`);
   }
 
-  // Start Next.js standalone server first (if available)
-  await startNextServer();
+  // Start Next.js standalone server first (if available).
+  try {
+    await startNextServer();
+    log.info("Dashboard server started successfully — loading dashboard URL");
+  } catch (e: any) {
+    log.error("============================================================");
+    log.error("DASHBOARD SERVER FAILED TO START");
+    log.error(`Reason: ${e?.message || e}`);
+    log.error("The app will load the offline page instead.");
+    log.error("Possible causes:");
+    log.error("  1. Build is broken — next-standalone/server.js missing from package");
+    log.error("  2. Port 38571 is already in use (another DISTORT instance?)");
+    log.error("  3. Database initialization failed");
+    log.error("  4. Next.js server crashed during startup");
+    log.error("Check the [next] log lines above for server-side errors.");
+    log.error("============================================================");
+  }
 
   createWindow();
   createTray();
@@ -3322,6 +3400,10 @@ app.on("before-quit", async (e) => {
   // CRITICAL: Always disable kill switch on quit, otherwise the user's internet
   // would be permanently blocked if the app crashed while kill switch was active.
   await disableKillSwitch();
+  // Stop the Next.js standalone server (port 38571) — without this, the child
+  // process (named DISTORT.exe on Windows) keeps running after the parent exits,
+  // causing orphaned-process accumulation across multiple launches.
+  stopNextServer();
   // Stop the companion control API server (port 10810).
   stopCompanionApiServer();
   // Stop the auto-updater's periodic check timer.
@@ -3337,6 +3419,7 @@ process.on("SIGINT", async () => {
   log.info("Received SIGINT — cleaning up…");
   await stopVpnEngine();
   await disableKillSwitch();
+  stopNextServer();
   stopCompanionApiServer();
   stopAutoUpdater();
   process.exit(0);
@@ -3345,6 +3428,7 @@ process.on("SIGTERM", async () => {
   log.info("Received SIGTERM — cleaning up…");
   await stopVpnEngine();
   await disableKillSwitch();
+  stopNextServer();
   stopCompanionApiServer();
   stopAutoUpdater();
   process.exit(0);
@@ -3356,6 +3440,7 @@ process.on("uncaughtException", async (err) => {
   try {
     await stopVpnEngine();
     await disableKillSwitch();
+    stopNextServer();
     stopCompanionApiServer();
     stopAutoUpdater();
   } catch {}
