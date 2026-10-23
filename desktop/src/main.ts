@@ -517,6 +517,15 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       log.error(`xray binary not found at: ${xrayPath}`);
       throw new Error("VPN engine binary missing");
     }
+    // DIAGNOSTIC: log binary path + size so we can verify it's not
+    // corrupted/zero-byte/antivirus-modified when investigating crashes.
+    try {
+      const xrayStat = fs.statSync(xrayPath);
+      log.info(`[startVpnEngine] xray binary: path=${xrayPath}, size=${xrayStat.size} bytes, modified=${xrayStat.mtime.toISOString()}`);
+    } catch (e: any) {
+      log.error(`[startVpnEngine] xray binary stat failed: ${e?.message}`);
+      throw new Error(`VPN engine binary inaccessible: ${e?.message}`);
+    }
 
     // Spawn xray.exe
     vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
@@ -538,6 +547,21 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
   // ---------------------------------------------------------------------
   currentVerifyAttempt++;
   const attemptId = currentVerifyAttempt;
+
+    // DIAGNOSTIC: spawn error handler — catches EACCES, EPERM, ENOENT,
+    // or any other error that prevents the process from starting.
+    // Without this, a spawn error is uncaught and the startupOutcome
+    // promise hangs forever (deadlock).
+    // NOTE: This handler is registered AFTER attemptId is assigned so
+    // the stale guard works correctly.
+    vpnProcess.on("error", (err: any) => {
+      const code = err?.code || "unknown";
+      log.error(`[startVpnEngine] xray SPAWN ERROR: ${err?.message || err} (code: ${code})`);
+      // STALE GUARD: only resolve if this is still the current attempt.
+      if (attemptId === currentVerifyAttempt) {
+        resolveStartupOutcome(false);
+      }
+    });
 
   // Track xray's health — only mark "connected" after REAL HTTP request through proxy
   let handshakeConfirmed = false;
@@ -722,19 +746,19 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     }
   });
 
-  vpnProcess.on("exit", (code) => {
-    log.info(`xray exited with code ${code}`);
+  vpnProcess.on("exit", (code, signal) => {
+    // DIAGNOSTIC: log BOTH code and signal so we can distinguish:
+    //   - code=0: clean exit (normal shutdown)
+    //   - code=1: xray error (config invalid, missing DLL, etc.)
+    //   - code=-1 / 4294967295: xray crashed (bind failure, missing dependency)
+    //   - code=null, signal!=null: killed by signal (SIGTERM/SIGKILL)
+    log.info(`[startVpnEngine] xray exited: code=${code}, signal=${signal}`);
     clearTimeout(startupTimeout);
     // STALE GUARD: if this exit is from a previous attempt's xray process,
     // don't let it overwrite the current vpn state.
     if (attemptId !== currentVerifyAttempt) {
-      log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code ${code}) — dropping`);
+      log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code=${code}, signal=${signal}) — dropping`);
       // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
-      // Without this, `await startupOutcome` for this (stale) attempt would
-      // hang forever. The exit event for THIS xray process has now fired,
-      // so startupTimeout's "process no longer active" check (L571) will
-      // never fire (the timeout was cleared above at L727). We must resolve
-      // here to unblock the await.
       resolveStartupOutcome(false);
       return;
     }
@@ -747,7 +771,7 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
         mainWindow?.webContents.send("vpn:kill-switch-activated");
       }
       // Note: startupOutcome was already resolved (true) by the verification
-      // success path (L608) that set vpn.connected = true. No need to resolve
+      // success path that set vpn.connected = true. No need to resolve
       // again — the await has already completed.
     } else if (!handshakeConfirmed && !startupError) {
       // xray exited BEFORE handshake completed and without a captured stderr
@@ -2070,6 +2094,14 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
       log.error(`[companion-api] xray binary not found at: ${xrayPath}`);
       return { ok: false, error: "VPN engine binary missing (xray not bundled)" };
     }
+    // DIAGNOSTIC: log binary path + size for crash investigation.
+    try {
+      const xrayStat = fs.statSync(xrayPath);
+      log.info(`[companion-api] xray binary: path=${xrayPath}, size=${xrayStat.size} bytes, modified=${xrayStat.mtime.toISOString()}`);
+    } catch (e: any) {
+      log.error(`[companion-api] xray binary stat failed: ${e?.message}`);
+      return { ok: false, error: `VPN engine binary inaccessible: ${e?.message}` };
+    }
 
     // PRE-FLIGHT VALIDATION (v1.0.34): run `xray run -test -c config.json` to
     // validate the config WITHOUT starting the tunnel. This catches 90% of
@@ -2126,6 +2158,10 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
     // in the response when xray exits immediately (v1.0.34).
     let stderrBuffer = "";
     const MAX_STDERR_BUFFER = 4096; // 4KB — enough for the last ~30 lines
+    // Track exit code + signal for diagnostic error reporting.
+    let lastExitCode: number | null = null;
+    let lastExitSignal: string | null = null;
+    let spawnError: string | null = null;
 
     try {
       vpnProcess = spawn(xrayPath, ["run", "-c", configPath], {
@@ -2157,8 +2193,11 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
           stderrBuffer = stderrBuffer.slice(-MAX_STDERR_BUFFER);
         }
       });
-      vpnProcess.on("exit", (code) => {
-        log.info(`[companion-api] xray exited with code ${code}`);
+      vpnProcess.on("exit", (code, signal) => {
+        // DIAGNOSTIC: log BOTH code and signal.
+        log.info(`[companion-api] xray exited: code=${code}, signal=${signal}`);
+        lastExitCode = code;
+        lastExitSignal = signal;
         // STALE GUARD: don't let a stale exit overwrite a newer connection state.
         if (companionAttemptId !== currentVerifyAttempt) {
           log.info(`[companion-api] stale exit from attempt ${companionAttemptId} — dropping`);
@@ -2176,15 +2215,29 @@ async function startTunnelFromUri(configUri: string): Promise<{ ok: boolean; err
         }
       });
 
+      // DIAGNOSTIC: spawn error handler — catches EACCES, EPERM, ENOENT,
+      // or any other error that prevents the process from starting.
+      // Without this, a spawn error is uncaught and the function would
+      // return a generic "no stderr output" error after the 2s timeout.
+      vpnProcess.on("error", (err: any) => {
+        const code = err?.code || "unknown";
+        log.error(`[companion-api] xray SPAWN ERROR: ${err?.message || err} (code: ${code})`);
+        spawnError = `${err?.message || err} (code: ${code})`;
+      });
+
       // Wait for xray to start (2s — increased from 500ms in v1.0.34).
-      // 500ms was too short: xray-core's TUN device setup, DNS resolver init,
-      // and SOCKS/HTTP listener binding can take 1-2 seconds on slower machines.
       await new Promise((r) => setTimeout(r, 2000));
 
       if (!vpnProcess || vpnProcess.killed) {
-        // xray exited within 2s — include the actual stderr so the user knows WHY.
+        // xray exited within 2s — include stderr + exitCode + signal + spawnError.
         const lastErr = stderrBuffer.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
-        const detail = lastErr || "no stderr output (xray binary may be missing or corrupted)";
+        const exitInfo = lastExitCode !== null ? ` (exit code: ${lastExitCode}, signal: ${lastExitSignal})` : "";
+        const spawnInfo = spawnError ? ` [spawn error: ${spawnError}]` : "";
+        const detail = lastErr
+          ? `${lastErr}${exitInfo}`
+          : spawnError
+            ? `${spawnError}${exitInfo}`
+            : `no stderr output${exitInfo} (xray binary may be missing, corrupted, or blocked by antivirus)${spawnInfo}`;
         return {
           ok: false,
           error: `xray crashed on startup: ${detail}`,
