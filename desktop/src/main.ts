@@ -584,6 +584,11 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
       // STALE GUARD: if this attempt is no longer current, drop the result.
       if (attemptId !== currentVerifyAttempt) {
         log.info(`[startVpnEngine] attempt ${attemptId} verification result received but superseded — dropping`);
+        // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+        // Without this, `await startupOutcome` would hang forever if the
+        // verification completed AFTER the attempt was superseded (e.g.,
+        // stopVpnEngine was called during the 10s verify window).
+        resolveStartupOutcome(false);
         return;
       }
       if (verified && !handshakeConfirmed && !startupError) {
@@ -618,7 +623,12 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     }).catch((e: any) => {
       // Defensive: verifyHttpThroughProxy should never throw (it catches internally)
       // but if it does, we MUST not leave the state in limbo.
-      if (attemptId !== currentVerifyAttempt) return;
+      if (attemptId !== currentVerifyAttempt) {
+        // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+        // Same reasoning as the stale path above.
+        resolveStartupOutcome(false);
+        return;
+      }
       log.error(`[startVpnEngine] verifyHttpThroughProxy threw unexpectedly: ${e?.message}`);
       store.set("vpn", {
         connected: false,
@@ -719,6 +729,13 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
     // don't let it overwrite the current vpn state.
     if (attemptId !== currentVerifyAttempt) {
       log.info(`[startVpnEngine] stale exit from attempt ${attemptId} (code ${code}) — dropping`);
+      // CRITICAL: resolve startupOutcome as failure to avoid a DEADLOCK.
+      // Without this, `await startupOutcome` for this (stale) attempt would
+      // hang forever. The exit event for THIS xray process has now fired,
+      // so startupTimeout's "process no longer active" check (L571) will
+      // never fire (the timeout was cleared above at L727). We must resolve
+      // here to unblock the await.
+      resolveStartupOutcome(false);
       return;
     }
     if (store.get("vpn.connected")) {
@@ -729,6 +746,9 @@ async function startVpnEngine(server: VpnState["server"], protocol: string, conf
         log.warn("Kill switch activated — xray exited unexpectedly");
         mainWindow?.webContents.send("vpn:kill-switch-activated");
       }
+      // Note: startupOutcome was already resolved (true) by the verification
+      // success path (L608) that set vpn.connected = true. No need to resolve
+      // again — the await has already completed.
     } else if (!handshakeConfirmed && !startupError) {
       // xray exited BEFORE handshake completed and without a captured stderr
       // error. This is the "bind failure" path: xray spawns, fails to bind,
