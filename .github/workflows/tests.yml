@@ -82,3 +82,45 @@ jobs:
         run: bun run src/lib/__tests__/xray-config.test.ts
         env:
           XRAY_BIN_PATH: /tmp/xray-bin/xray
+
+      # ─── Desktop (Electron) tests ────────────────────────────────────────────
+      # These live in desktop/src/__tests__/ and import bun:test + node-fetch +
+      # https-proxy-agent from desktop/node_modules. They MUST run with
+      # working-directory: desktop so bun resolves the right deps.
+      #
+      # Without these steps CI reported success even when desktop tests were
+      # broken — a false green. The most important regression tests here are:
+      #   - verify-tunnel.test.ts        → verifies leak-detection logic
+      #   - quick-connect-failover.test.ts → verifies tiered failover + stale guard
+      #   - stop-and-companion-stale-guard.test.ts → verifies stopVpnEngine exit
+      #     wait + companion API stale-guard counter sharing (v1.0.38 audit)
+      #   - production-verify-tunnel.test.ts → exercises real node-fetch +
+      #     https-proxy-agent against a mock proxy (closest to real Electron)
+      - name: Install desktop deps
+        working-directory: desktop
+        run: bun install
+
+      - name: Run desktop verifier tests
+        working-directory: desktop
+        run: bun test src/__tests__/verify-tunnel.test.ts
+
+      - name: Run desktop failover tests
+        working-directory: desktop
+        run: bun test src/__tests__/quick-connect-failover.test.ts
+
+      - name: Run desktop stale-guard tests
+        working-directory: desktop
+        run: bun test src/__tests__/stop-and-companion-stale-guard.test.ts
+
+      - name: Run desktop production-verify tests
+        working-directory: desktop
+        run: bun test src/__tests__/production-verify-tunnel.test.ts
+
+      - name: Run desktop stuck-deterministic tests
+        working-directory: desktop
+        run: bun test src/__tests__/stuck-deterministic.test.ts
+
+      - name: Run desktop xray-process-manager tests
+        working-directory: desktop
+        run: bun test src/__tests__/xray-process-manager.test.ts
+

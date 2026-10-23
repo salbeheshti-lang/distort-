@@ -186,24 +186,25 @@ describe("verifyTunnelTraffic", () => {
     expect(result.verified).toBe(false);
     expect(result.exitIp).toBeNull();
     expect(result.leakDetected).toBe(false);
-    expect(result.error).toMatch(/no valid trace/);
+    expect(result.error).toMatch(/no valid.*ip=.*field|not a cloudflare trace/i);
   });
 
-  test("returns verified=true when real IP fetch fails (can't prove a leak)", async () => {
-    // If the direct (non-proxied) fetch fails (e.g. captive portal, no
-    // direct internet), we can't prove a leak — but the proxy fetch itself
-    // succeeded, so we mark verified=true. This is the conservative choice
-    // that avoids false negatives when the user's network is partially
-    // blocked.
+  test("returns verified=false when real IP fetch fails (cannot prove no leak)", async () => {
+    // STRICT VERIFICATION (v1.0.38): if the direct (non-proxied) fetch fails
+    // (realIp === null), we CANNOT verify the tunnel — we have no way to prove
+    // the tunnel is actually routing traffic. "No proof of leak" is NOT "proof
+    // of no leak". The previous implementation returned verified=true here,
+    // which was a false-positive bug.
     const result = await verifyTunnelTraffic({
       proxyFetcher: makeProxyFetcher({ ip: "5.6.7.8", loc: "FR" }),
       realIpFetcher: makeRealIpFetcher(null),
     });
 
-    expect(result.verified).toBe(true);
+    expect(result.verified).toBe(false);
     expect(result.exitIp).toBe("5.6.7.8");
     expect(result.realIp).toBeNull();
     expect(result.leakDetected).toBe(false);
+    expect(result.error).toMatch(/real IP fetch failed/i);
   });
 
   test("proxy fetcher is called with the cloudflare trace URL", async () => {

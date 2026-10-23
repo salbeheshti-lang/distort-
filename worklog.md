@@ -1490,3 +1490,36 @@ Stage Summary:
   2. Run `bun run lint` + `cd desktop && bunx tsc --noEmit` + `cd desktop && bun test src/__tests__/verify-tunnel.test.ts` on your end to confirm 0 errors + 16/16 tests pass.
   3. Optionally: spin up the desktop app + click Quick Connect on a real network to verify the new log lines appear in %APPDATA%\DISTORT\logs\main.log as expected.
   4. Bump desktop/package.json to 1.0.37 + tag + build.
+
+---
+Task ID: V1.0.37-RELEASE
+Agent: main (orchestrator)
+Task: Release v1.0.37 with critical verifyTunnelTraffic fix
+
+Work Log:
+- Reviewed startVpnEngine + verifyTunnelTraffic + stopVpnEngine per user's request
+- Found CRITICAL bug: Node's fetch() ignores HTTP_PROXY env var, so verifyTunnelTraffic was making DIRECT requests — always returned the user's real IP, marked vpn.connected=true even when tunnel was broken
+- Delegated fix to full-stack-developer subagent (Task ID: VERIFY-TUNNEL-FIX):
+  - NEW desktop/src/tunnel-verifier.ts: uses node-fetch + https-proxy-agent to FORCE traffic through xray's HTTP proxy at 127.0.0.1:10809
+  - Added leak detection: compares exit IP (through proxy) with real IP (direct) — if they match, tunnel is NOT routing traffic
+  - Increased tryQuickConnectTier wait from 7s to 20s (startVpnEngine schedules verification at 5s + 10s fetch timeout = 15s)
+  - Added 500ms port-release wait in stopVpnEngine to prevent EADDRINUSE on rapid reconnect
+  - Added diagnostic logs for PID, verification start, result with exitIp/realIp/leakDetected
+  - NEW desktop/src/__tests__/verify-tunnel.test.ts: 16 unit tests, all pass
+- Verified locally: lint 0 errors, tsc 0 errors, 16/16 tests pass
+- Bumped desktop/package.json version 1.0.36 -> 1.0.37
+- Committed + pushed to main + tagged v1.0.37
+- CI build completed: success
+- Published draft release (set draft=false, make_latest=true)
+- latest.yml verified: version 1.0.37, sha512, size 224MB
+- Latest release is now v1.0.37
+
+Stage Summary:
+- v1.0.37 released with the CRITICAL verification fix
+- The app will now ONLY report "Connected" when:
+  1. xray process spawns successfully
+  2. HTTP request through xray's SOCKS5/HTTP proxy succeeds
+  3. Response contains a valid cloudflare trace
+  4. Exit IP (through tunnel) DIFFERS from real IP (direct) — no leak
+- 16 unit tests cover the verification logic including the leak-detection regression test
+- HONEST LIMITATION: CI green + unit tests pass ≠ real-world Iran connectivity. Only a real Quick Connect attempt on the target network proves the configs work. But at least now the app won't FALSELY claim "Connected" when the tunnel is broken — that was the critical bug we just fixed.
